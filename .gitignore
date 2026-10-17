@@ -1,6 +1,11 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 *.egg-info/
 .venv/
 dist/
@@ -11,6 +16,8 @@ build/
 .runtime*/
 .all-git/
 .aris/
+/.aws/
+/.vscode/
 EXPERIMENT_AUDIT.md
 EXPERIMENT_AUDIT.json
 
@@ -22,6 +29,7 @@ EXPERIMENT_AUDIT.json
 /artifacts
 /vendor
 /containers/wheels
+/cluster/cuhk-suite/logs/
 Memix-core-share-*.tar.gz
 
 # Provider credentials and local endpoint configuration.

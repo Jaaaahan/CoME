@@ -23,6 +23,7 @@ from .base import BaseMemoryMethod, GenerationConfig, MethodCapabilities, Method
 from .media import question_text, uniformly_sample_video
 from ..text_cleaning import clean_labeled_ocr_block
 from .vector_index import FaissFlatIPIndex, VectorIndex
+from .memory_backend import backend_hash
 
 
 @lru_cache(maxsize=512)
@@ -199,6 +200,11 @@ class ConcreteMemixMethod(BaseMemoryMethod):
     injected multimodal embedder and exact FAISS, then delegates task planning,
     predicate filtering, metadata boosts, and boundary completion to the
     original Memix core without exposing evaluator-only annotations.
+
+    The explicit standalone backend reuses ingestion, multi-view source priors,
+    and fixed-evidence reading without loading Memix. Its direct answer path is
+    a dense-retrieval baseline; GraphMemix's separate graph stages select the
+    final evidence for the standalone GraphMemix pipeline.
     """
 
     capabilities = MethodCapabilities(
@@ -217,6 +223,7 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         embedder: MultiModalEmbedder,
         index: VectorIndex | None = None,
         memix_repo: str | Path = "vendor/memix-core",
+        backend: str = "memix",
         checkpoint_dir: str | Path | None = None,
         checkpoint_interval: int = 100,
         ingest_batch_size: int = 16,
@@ -232,6 +239,11 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         verifier_image_max_edge: int = 448,
     ) -> None:
         super().__init__(generation)
+        if backend not in {"memix", "standalone"}:
+            raise ValueError(f"unknown memory backend: {backend}")
+        if backend == "standalone" and (use_llm_planner or use_llm_verify):
+            raise ValueError("standalone mode does not implement the external Memix planner/verifier")
+        self.backend = backend
         if checkpoint_interval <= 0 or ingest_batch_size <= 0:
             raise ValueError("Memix checkpoint interval and ingest batch size must be positive")
         if source_top_k < self.generation.top_k or video_frames <= 0:
@@ -265,22 +277,26 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         self.verifier_image_max_edge = verifier_image_max_edge
         self._verifier_local = threading.local()
         self._query_caption_memory_cache: dict[str, str] = {}
-        self.core = _load_memix_core(self.memix_repo)
-        local_provider = "vllm" if (use_llm_planner or use_llm_verify) else "none"
-        endpoint = self.generation.base_url.rstrip("/") + "/chat/completions"
-        local_client = self.core.base.ChatClient(
-            provider=local_provider,
-            model=self.generation.model,
-            endpoint=endpoint if local_provider != "none" else None,
-            temperature=0,
-            max_tokens=1400,
-            timeout=1200,
-        )
-        self._local_client = _VerifierInputClient(
-            local_client,
-            lambda: getattr(self._verifier_local, "context", None),
-        )
-        self._config = self._make_config()
+        self.core = None
+        self._local_client = None
+        self._config = None
+        if backend == "memix":
+            self.core = _load_memix_core(self.memix_repo)
+            local_provider = "vllm" if (use_llm_planner or use_llm_verify) else "none"
+            endpoint = self.generation.base_url.rstrip("/") + "/chat/completions"
+            local_client = self.core.base.ChatClient(
+                provider=local_provider,
+                model=self.generation.model,
+                endpoint=endpoint if local_provider != "none" else None,
+                temperature=0,
+                max_tokens=1400,
+                timeout=1200,
+            )
+            self._local_client = _VerifierInputClient(
+                local_client,
+                lambda: getattr(self._verifier_local, "context", None),
+            )
+            self._config = self._make_config()
         self._context_id = ""
         self._records: list[dict[str, Any]] = []
         self._record_by_id: dict[str, dict[str, Any]] = {}
@@ -496,7 +512,7 @@ class ConcreteMemixMethod(BaseMemoryMethod):
                 }
                 for chunk in _atomic_text_chunks(text, self.media_atomic_limit)
             )
-        return record, units
+        return record, units  #record is a entire memory record, embedding unit is passed to form the embedding vector
 
     def _frame_path(self, memory_id: str, frame_index: int, frame: str) -> str:
         state_dir = self._state_dir()
@@ -536,6 +552,8 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         return value
 
     def _rebuild_memory_index(self) -> None:
+        if self.backend == "standalone":
+            return  # The FAISS index and record map already contain everything needed.
         self._memory_index = (
             self.core.MemoryIndex.from_items(self._retrieval_items(), scope_mode="global")
             if self._records else None
@@ -652,6 +670,12 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         *,
         source_detail: Mapping[str, Any] | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
+        if self.backend == "standalone":
+            detail = source_detail if source_detail is not None else self._source_detail(question)
+            selected = list(dict.fromkeys(map(str, detail["retrieval_ids"])))[:self.generation.top_k]
+            if any(mid not in self._record_by_id for mid in selected):
+                raise ValueError("source priors reference memories outside the current context")
+            return selected, {"backend": "standalone-dense-v1", "reranking": False}
         if self._memory_index is None:
             self._rebuild_memory_index()
         if self._memory_index is None:
@@ -705,7 +729,7 @@ class ConcreteMemixMethod(BaseMemoryMethod):
     ) -> dict[str, Any]:
         return {
             "retrieved_memory_ids": list(selected_ids),
-            "method": "memix-canonical-source-prior",
+            "method": "standalone-dense-v1" if self.backend == "standalone" else "memix-canonical-source-prior",
             "source_top_k": self.source_top_k,
             "filter_counts": dict(filter_counts),
             "media_failures": len(self._media_failures),
@@ -847,16 +871,7 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         )
 
     def _core_hash(self) -> str:
-        digest = hashlib.sha256()
-        for relative in (
-            "scripts/QA_Agent/MMRAG/memix_memory.py",
-            "scripts/QA_Agent/MMRAG/iterative_reasoning_retrieval_eval.py",
-            "scripts/QA_Agent/MMRAG/task_aware_cascade_retrieval_eval.py",
-        ):
-            path = self.memix_repo / relative
-            digest.update(relative.encode())
-            digest.update(path.read_bytes())
-        return digest.hexdigest()
+        return backend_hash(self.backend, self.memix_repo)
 
     def _checkpoint_config(self) -> dict[str, Any]:
         config = {
@@ -870,6 +885,10 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         # optional strategy is disabled.
         if self.media_atomic_limit:
             config["media_atomic_limit"] = self.media_atomic_limit
+        if self.backend == "standalone":
+            config["format"] = "graphmemix-standalone-checkpoint-1"
+            config["backend"] = "standalone-dense-v1"
+            config["embedding_model_identity"] = getattr(self.embedder, "model_identity", None)
         return config
 
     def _save_checkpoint(self, *, force: bool = False) -> None:

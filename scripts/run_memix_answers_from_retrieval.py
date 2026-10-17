@@ -25,6 +25,7 @@ from mm_memory_bench.methods.backends import (
 from mm_memory_bench.methods.concrete_memix import ConcreteMemixMethod, _reader_data_url
 from mm_memory_bench.methods.media import question_text, uniformly_sample_video
 from mm_memory_bench.reader import BundleReader
+from mm_memory_bench.methods.memory_backend import backend_hash, backend_contract
 from mm_memory_bench.core import resolve_asset_path
 
 from run_memix_retrieval_only import (
@@ -124,11 +125,12 @@ def hydrate_reader(
     public_asset_paths: Mapping[str, str],
     reader_ocr_budget_chars: int = 0,
     video_frames_override: int = 0,
+    backend: str = "memix",
 ) -> ConcreteMemixMethod:
     state = json.loads(checkpoint_state.read_text(encoding="utf-8"))
     config = dict(state.get("config", {}))
     expected_hash = str(config.get("core_sha256", ""))
-    actual_hash = core_hash(memix_repo)
+    actual_hash = backend_hash(backend, memix_repo)
     if actual_hash != expected_hash:
         raise RuntimeError(
             f"Memix core hash mismatch: checkpoint={expected_hash} current={actual_hash}"
@@ -139,6 +141,7 @@ def hydrate_reader(
         embedder=UnusedEmbedder(int(config.get("embedding_dimension", 1536))),
         index=ReaderOnlyIndex(),
         memix_repo=memix_repo,
+        backend=backend,
         checkpoint_dir=None,
         source_top_k=source_top_k,
         video_frames=(
@@ -365,10 +368,12 @@ def main() -> int:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--retrieval", type=Path, required=True)
     parser.add_argument("--checkpoint-root", type=Path, required=True)
-    parser.add_argument("--memix-repo", type=Path, required=True)
+    parser.add_argument("--memix-repo", type=Path, default=Path("vendor/memix-core"))
+    parser.add_argument("--backend", choices=("memix", "standalone"), default="memix")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8091/v1")
     parser.add_argument("--model", default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--local-model", type=Path, help="Read evidence with local Transformers weights; requires concurrency=1.")
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument(
         "--timeout-seconds", type=float, default=1200,
@@ -466,6 +471,8 @@ def main() -> int:
     )
     parser.add_argument("--progress-interval", type=int, default=25)
     args = parser.parse_args()
+    if args.local_model and (args.concurrency != 1 or args.single_pass_normal):
+        parser.error("--local-model requires --concurrency 1 and exact token preflight")
     configure_legacy_empty_choices(args.legacy_empty_choices)
 
     if (
@@ -542,10 +549,17 @@ def main() -> int:
         "low_image_max_edge": args.low_image_max_edge,
         "reader_ocr_budget_chars": args.reader_ocr_budget_chars,
         "reader_media_mode": args.reader_media_mode,
-        "memix_core_sha256": core_hash(args.memix_repo),
+        **backend_contract(args.backend, args.memix_repo),
     }
     if args.video_frames_override > 0:
         reader_contract["video_frames_override"] = args.video_frames_override
+    if args.local_model:
+        from mm_memory_bench.methods import local_qwen
+        reader_contract["reader_runtime"] = "transformers-local-greedy-v1"
+        reader_contract["local_model"] = str(args.local_model.resolve())
+        reader_contract["local_transport_sha256"] = hashlib.sha256(
+            Path(local_qwen.__file__).read_bytes()
+        ).hexdigest()
     state_hashes = {
         context_id: hashlib.sha256(path.read_bytes()).hexdigest()
         for context_id, path in states.items()
@@ -644,6 +658,11 @@ def main() -> int:
             token_count_mode=args.token_count_mode,
         )
     )
+    if args.local_model:
+        answer_model = OpenAICompatibleQwenVL(
+            generation, token_count_mode="remote",
+            transport=local_qwen.TransformersQwenTransport(str(args.local_model), args.max_model_len),
+        )
 
     rows_by_context: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
     for question, retrieval_row in selected_rows:
@@ -663,6 +682,7 @@ def main() -> int:
             method = hydrate_reader(
                 checkpoint_state=states[context_id],
                 memix_repo=args.memix_repo,
+                backend=args.backend,
                 generation=generation,
                 answer_model=answer_model,
                 source_top_k=args.source_top_k,

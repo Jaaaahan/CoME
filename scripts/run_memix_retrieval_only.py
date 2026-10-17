@@ -21,6 +21,7 @@ from mm_memory_bench.methods import (
 from mm_memory_bench.methods import concrete_memix as concrete_memix_module
 from mm_memory_bench.methods.media import question_text as canonical_question_text
 from mm_memory_bench.reader import BundleReader
+from mm_memory_bench.methods.memory_backend import backend_hash
 
 
 CORE_FILES = (
@@ -59,14 +60,7 @@ def configure_legacy_empty_choices(enabled: bool) -> None:
 
 
 def core_hash(root: Path) -> str:
-    digest = hashlib.sha256()
-    for relative in CORE_FILES:
-        path = root / relative
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        digest.update(relative.encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+    return backend_hash("memix", root)
 
 
 def file_hash(path: Path) -> str:
@@ -187,11 +181,12 @@ def hydrate_method(
 def hydrate_reranker(
     *, checkpoint_state: Path, memix_repo: Path, source_top_k: int,
     public_source_ids: Mapping[str, str] | None = None,
+    backend: str = "memix",
 ) -> ConcreteMemixMethod:
     state = json.loads(checkpoint_state.read_text(encoding="utf-8"))
     config = dict(state.get("config", {}))
     expected_hash = str(config.get("core_sha256", ""))
-    actual_hash = core_hash(memix_repo)
+    actual_hash = backend_hash(backend, memix_repo)
     if actual_hash != expected_hash:
         raise RuntimeError(
             f"Memix core hash mismatch: checkpoint={expected_hash} current={actual_hash}"
@@ -203,6 +198,7 @@ def hydrate_reranker(
         embedder=UnusedEmbedder(dimension),
         index=FaissFlatIPIndex(dimension),
         memix_repo=memix_repo,
+        backend=backend,
         checkpoint_dir=None,
         source_top_k=source_top_k,
         video_frames=int(config.get("video_frames", 8)),

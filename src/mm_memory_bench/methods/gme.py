@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import io
+import hashlib
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -38,6 +40,23 @@ class GMEQwen2VLEmbedder:
             trust_remote_code=True,
         ).eval()
         self._dimension = dimension
+        root = Path(model_name)
+        if root.is_dir():
+            digest = hashlib.sha256()
+            for path in sorted(root.iterdir()):
+                if path.is_file() and (path.suffix == ".safetensors" or path.name in {
+                    "config.json", "modeling_gme_qwen2vl.py", "preprocessor_config.json",
+                    "tokenizer.json", "tokenizer_config.json",
+                }):
+                    digest.update(path.name.encode())
+                    with path.open("rb") as handle:
+                        file_digest = hashlib.sha256()
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            file_digest.update(chunk)
+                        digest.update(file_digest.digest())
+            self.model_identity = digest.hexdigest()
+        else:
+            self.model_identity = f"{model_name}@{getattr(self.model.config, '_commit_hash', None)}"
 
     @property
     def dimension(self) -> int:

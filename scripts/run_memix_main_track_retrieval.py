@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+from contextlib import nullcontext
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -14,11 +15,11 @@ from mm_memory_bench.methods import (
     GMEQwen2VLEmbedder,
 )
 from mm_memory_bench.reader import BundleReader
+from mm_memory_bench.methods.memory_backend import backend_hash, backend_contract
 
 from run_memix_retrieval_only import (
     SOURCE_PRIOR_PROTOCOL,
     append_jsonl,
-    core_hash,
     file_hash,
     hydrate_reranker,
     init_rerank_worker,
@@ -26,6 +27,13 @@ from run_memix_retrieval_only import (
     process_select,
     read_jsonl,
 )
+
+
+def select_dense(method, values):
+    raw, resolved, detail = values
+    started = time.perf_counter()
+    selected, counts = method._select_evidence(resolved, source_detail=detail)
+    return raw, selected, counts, time.perf_counter() - started
 
 
 def checkpoint_states(root: Path) -> dict[str, Path]:
@@ -57,7 +65,8 @@ def main() -> int:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--checkpoint-root", type=Path, required=True)
     parser.add_argument("--embedding-model", type=Path, required=True)
-    parser.add_argument("--memix-repo", type=Path, required=True)
+    parser.add_argument("--memix-repo", type=Path, default=Path("vendor/memix-core"))
+    parser.add_argument("--backend", choices=("memix", "standalone"), default="memix")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-priors", type=Path, required=True)
     parser.add_argument("--question-ids", type=Path)
@@ -77,7 +86,7 @@ def main() -> int:
     missing = context_ids - states.keys()
     if missing:
         raise ValueError(f"missing checkpoints for {len(missing)} contexts: {sorted(missing)}")
-    expected_core = core_hash(args.memix_repo)
+    expected_core = backend_hash(args.backend, args.memix_repo)
     for context_id in context_ids:
         state = json.loads(states[context_id].read_text(encoding="utf-8"))
         actual = str(state.get("config", {}).get("core_sha256", ""))
@@ -96,10 +105,10 @@ def main() -> int:
         for batch in batches for question in batch.questions
     }
     base_contract = {
-        "source_prior_protocol": SOURCE_PRIOR_PROTOCOL,
+        "source_prior_protocol": "graphmemix-standalone-prior-v1" if args.backend == "standalone" else SOURCE_PRIOR_PROTOCOL,
         "source_top_k": args.source_top_k,
         "legacy_empty_choices": False,
-        "memix_core_sha256": expected_core,
+        **backend_contract(args.backend, args.memix_repo),
         "embedding_model_manifest_sha256": model_manifest_hash(args.embedding_model),
         "questions_sha256": file_hash(args.bundle / "questions.jsonl"),
     }
@@ -175,6 +184,7 @@ def main() -> int:
             method = hydrate_reranker(
                 checkpoint_state=state_path,
                 memix_repo=args.memix_repo,
+                backend=args.backend,
                 source_top_k=args.source_top_k,
                 public_source_ids=public_source_ids,
             )
@@ -212,12 +222,16 @@ def main() -> int:
 
             inputs = [(raw, resolved, detail) for (raw, resolved), detail in zip(pairs, details)]
             context = mp.get_context("spawn")
-            with context.Pool(
+            with (context.Pool(
                 processes=min(args.processes, len(inputs)),
                 initializer=init_rerank_worker,
                 initargs=(state_path, args.memix_repo, args.source_top_k, False, public_source_ids),
-            ) as pool:
-                for raw, selected, counts, latency in pool.imap(process_select, inputs, chunksize=1):
+            ) if args.backend == "memix" else nullcontext()) as pool:
+                selections = (
+                    pool.imap(process_select, inputs, chunksize=1) if pool is not None
+                    else (select_dense(method, values) for values in inputs)
+                )
+                for raw, selected, counts, latency in selections:
                     append_jsonl(output_handle, {
                         "question_id": raw["question_id"],
                         "semantic_question_id": raw.get("semantic_question_id", raw["question_id"]),
@@ -227,7 +241,7 @@ def main() -> int:
                         "retrieved_memory_ids": selected,
                         "latency_seconds": latency,
                         "metadata": {
-                            "method": "memix-main-track-retrieval-only",
+                            "method": "standalone-dense-v1" if args.backend == "standalone" else "memix-main-track-retrieval-only",
                             "source_top_k": args.source_top_k,
                             "public_source_ids": True,
                             "filter_counts": counts,

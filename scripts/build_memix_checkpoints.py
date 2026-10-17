@@ -28,12 +28,14 @@ def main() -> int:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--checkpoint-root", type=Path, required=True)
     parser.add_argument("--embedding-model", type=Path, required=True)
-    parser.add_argument("--memix-repo", type=Path, required=True)
+    parser.add_argument("--memix-repo", type=Path, default=Path("vendor/memix-core"))
+    parser.add_argument("--backend", choices=("memix", "standalone"), default="memix")
     parser.add_argument("--caption-sidecar", type=Path)
     parser.add_argument("--memory-view", default="raw_derived")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--checkpoint-interval", type=int, default=100)
     parser.add_argument("--video-frames", type=int, default=8)
+    parser.add_argument("--progress-interval", type=int, default=100)
     args = parser.parse_args()
 
     reader = BundleReader(args.bundle, caption_sidecar=args.caption_sidecar)
@@ -44,6 +46,7 @@ def main() -> int:
         embedder=embedder,
         index=FaissFlatIPIndex(embedder.dimension),
         memix_repo=args.memix_repo,
+        backend=args.backend,
         checkpoint_dir=args.checkpoint_root,
         checkpoint_interval=args.checkpoint_interval,
         ingest_batch_size=args.batch_size,
@@ -56,10 +59,16 @@ def main() -> int:
         context_started = time.perf_counter()
         method.begin_context(_visible_context(batch.context))
         try:
-            for memory in batch.memories:
+            for memory_index, memory in enumerate(batch.memories, 1):
                 method.ingest(
                     _resolved_memory(reader, memory, memory_view=args.memory_view)
                 )
+                if args.progress_interval > 0 and memory_index % args.progress_interval == 0:
+                    print(json.dumps({
+                        "event": "ingest_progress", "context_id": batch.context["context_id"],
+                        "memories": memory_index, "total": len(batch.memories),
+                        "elapsed_seconds": time.perf_counter() - context_started,
+                    }), flush=True)
         except BaseException:
             method.abort_context()
             raise

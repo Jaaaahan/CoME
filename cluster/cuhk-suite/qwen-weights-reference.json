@@ -1,0 +1,31 @@
+{
+  "model": "Qwen/Qwen3-VL-8B-Instruct",
+  "reference_revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+  "weights_match": true,
+  "files": [
+    {
+      "file": "model-00001-of-00004.safetensors",
+      "sha256": "d5d0aef0eb170fc7453a296c43c0849a56f510555d3588e4fd662bb35490aefa",
+      "expected": "d5d0aef0eb170fc7453a296c43c0849a56f510555d3588e4fd662bb35490aefa",
+      "matches": true
+    },
+    {
+      "file": "model-00002-of-00004.safetensors",
+      "sha256": "8be88fb5501e4d5719a6d4cc212e6a13480330e74f3e8c77daa1a68f199106b5",
+      "expected": "8be88fb5501e4d5719a6d4cc212e6a13480330e74f3e8c77daa1a68f199106b5",
+      "matches": true
+    },
+    {
+      "file": "model-00003-of-00004.safetensors",
+      "sha256": "83de00eafe6e0d57ccd009dbcf71c9974d74df2f016c27afb7e95aafd16b2192",
+      "expected": "83de00eafe6e0d57ccd009dbcf71c9974d74df2f016c27afb7e95aafd16b2192",
+      "matches": true
+    },
+    {
+      "file": "model-00004-of-00004.safetensors",
+      "sha256": "0a88b98e9f96270973f567e6a2c103ede6ccdf915ca3075e21c755604d0377a5",
+      "expected": "0a88b98e9f96270973f567e6a2c103ede6ccdf915ca3075e21c755604d0377a5",
+      "matches": true
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+Standalone GraphMemix backend
+============================
+
+The published release requires external Memix source files that are absent
+from this checkout. --backend standalone is an explicit alternative; the
+existing default remains --backend memix and still requires that source.
+
+Standalone mode reuses the published ingestion and memory representations,
+GME-Qwen2-VL embeddings, exact FAISS search, max pooling across representations,
+GraphMemix relation construction, node verification, ECV, forest selection,
+exact pruning, and fixed-evidence reader prompts. The external Memix planner,
+predicate filters, metadata boosts, and boundary completion are not emulated.
+The standalone adapter's direct answer method is a dense-retrieval baseline.
+GraphMemix selection is performed by the separate graph pipeline stages.
+
+Checkpoint format: graphmemix-standalone-checkpoint-1. The format, backend
+source hash, and embedding model identity are recorded and validated when
+resuming ingestion. Source priors and reader outputs use explicit standalone
+provenance. Do not rename or reuse original Memix checkpoints as standalone.
+
+Run the existing suite with --backend standalone, for example:
+
+python scripts/run_graphmemix_release.py benchmark --dataset atm \
+  --backbone qwen3vl8b --backend standalone \
+  --base-url http://127.0.0.1:8000/v1 --to-stage prune
+
+Data, model weights, and paths must first be prepared as described in the
+original release guide. The embedding-model path in the execution config must
+resolve to local GME weights because prior provenance hashes those files.
+
+The reader also accepts --backend standalone. For servers with a restrictive
+image-count cap, --local-model /path/to/Qwen3-VL-8B-Instruct --concurrency 1
+uses Transformers directly. This preserves selected images and sampled video
+frames, performs exact processor-based token counting, uses greedy decoding,
+and retains the existing 32K context and overflow handling. Local reading
+supports plain multimodal QA, not tool calls or constrained response formats.
+Use Transformers 4.57.1 for Qwen3-VL; the published GME custom code requires
+Transformers 4.51.3, so separate Conda environments are recommended.
+
+Validation:
+  PYTHONPATH=.:src:scripts python -m pytest -q tests
+
+This is an independent reproduction. Without the authors' missing component
+and reference artifacts, equivalence to their original execution has not been
+established. Pilot results must not be reported as full-benchmark results or
+as GPT-5-mini judge accuracy unless that evaluator was actually run.
+
+Release configuration caveat
+----------------------------
+The published runner explicitly sets --memory-view derived. When descriptions
+exist, the harness replaces raw memory images/video with derived text. Thus
+that default produces caption/OCR memory retrieval and reading; a multimodal
+encoder alone does not make it raw-media retrieval. Query images can still be
+present. The local pilot reproduces this setting and is labeled accordingly.
+The checkpoint builder supports raw_derived, but such experiments require a
+separate checkpoint/artifact directory and must not reuse derived checkpoints.
+
+The local ATM pilot also produced zero explicit relations under the released
+defaults (the store still contained 23,962 semantic edges). ECV is restricted
+to explicit relations and therefore made no model calls. All final selections
+used zero edges. These outputs validate the pipeline's execution, not the
+paper's graph-connection claims. Inspect eligible_edge_candidates and selected
+edges before interpreting any run as a test of graph-based reasoning.

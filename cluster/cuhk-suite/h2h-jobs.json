@@ -1,0 +1,167 @@
+{
+  "submitted_at": "2026-10-17T17:39:16.996957+08:00",
+  "experiment_root": "/share/workspace3/yhjia/graphmemix/experiments/h2hmem-4090-20261017",
+  "environment_check": "78499",
+  "jobs": {
+    "preflight": {
+      "id": "78500",
+      "script": "h2h_prepare.sbatch",
+      "submit_options": [
+        "--hold"
+      ],
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:00:50",
+      "released_after_verified_transfer": true
+    },
+    "captions": {
+      "id": "78520",
+      "script": "h2h_caption.sbatch",
+      "submit_options": [
+        "--partition=gpu2node"
+      ],
+      "state": "RUNNING",
+      "remaining_dependency": null,
+      "node": "gpu01",
+      "started_at": "2026-10-17T20:32:38+08:00",
+      "phase": "Caption generation running; model service self-tests passed",
+      "saved_caption_rows_before_retry": 11,
+      "validated_caption_rows": 15,
+      "failed_image_recovered": true
+    },
+    "index": {
+      "id": "78521",
+      "script": "h2h_index.sbatch",
+      "submit_options": [
+        "--partition=gpu2node",
+        "--dependency=afterok:78520",
+        "--kill-on-invalid-dep=yes"
+      ],
+      "state": "PENDING (Dependency)"
+    },
+    "evaluation": {
+      "id": "78522",
+      "script": "h2h_run.sbatch",
+      "submit_options": [
+        "--partition=gpu2node",
+        "--dependency=afterok:78521",
+        "--kill-on-invalid-dep=yes"
+      ],
+      "state": "PENDING (Dependency)"
+    }
+  },
+  "observed_at": "2026-10-17T20:34:50+08:00",
+  "environment_check_state": "COMPLETED exit 0",
+  "ready": true,
+  "answers_generated": 0,
+  "caption_reuse": {
+    "state": "CANCELLED for handoff to independent job 78501",
+    "job_id": 78453,
+    "step_id": "78453.4",
+    "node": "gpu03",
+    "base_url": "http://127.0.0.1:19262/v1",
+    "concurrency": 1,
+    "validated_caption_rows": 3,
+    "total_caption_assets": 1300,
+    "shared_with": "MemGallery Qwen service",
+    "extra_gpu_allocation": 0,
+    "script": "h2h_caption_reuse.sh",
+    "log": "/share/workspace3/yhjia/graphmemix/experiments/h2hmem-4090-20261017/logs/caption-reuse-78453-4.log",
+    "observed_at": "2026-10-17T18:49:46+08:00",
+    "ended_at": "2026-10-17T18:49:30+08:00",
+    "caption_rows_at_handoff": 3
+  },
+  "scheduler_verification": {
+    "select_type": "select/cons_tres",
+    "select_type_parameters": "CR_CPU",
+    "advertised_qos_memory_gib": 64,
+    "running_jobs": {
+      "78453": {
+        "node": "gpu03",
+        "gpus": 2,
+        "requested_memory_gib": 48
+      },
+      "78520": {
+        "node": "gpu01",
+        "gpus": 2,
+        "requested_memory_gib": 48
+      }
+    },
+    "concurrent_admission_verified": true,
+    "resource_requests_changed": false
+  },
+  "superseded_jobs": {
+    "78501": {
+      "id": "78501",
+      "script": "h2h_caption.sbatch",
+      "submit_options": [
+        "--dependency=afterok:78500,afterany:78453",
+        "--kill-on-invalid-dep=yes"
+      ],
+      "state": "FAILED",
+      "remaining_dependency": null,
+      "role": "Independent caption job; resumes existing sidecar, then releases the H2H index dependency.",
+      "node": "gpu04",
+      "started_at": "2026-10-17T18:48:56+08:00",
+      "phase": "Environment/GPU initialization; dedicated model service startup pending",
+      "updates": [
+        {
+          "at": "2026-10-17T18:48:56+08:00",
+          "command": "scontrol update JobId=78501 Dependency=0",
+          "reason": "User requested independent concurrent execution; the scheduler accepted the unchanged 48 GiB resource request."
+        }
+      ],
+      "exit_code": "1:0",
+      "ended_at": "2026-10-17T20:13:07+08:00",
+      "failure": "caption did not terminate normally; repetitive generation exhausted 1000 tokens",
+      "saved_caption_rows": 11
+    },
+    "78502": {
+      "id": "78502",
+      "script": "h2h_index.sbatch",
+      "submit_options": [
+        "--dependency=afterok:78501",
+        "--kill-on-invalid-dep=yes"
+      ],
+      "state": "CANCELLED",
+      "ended_at": "2026-10-17T20:13:08+08:00",
+      "reason": "upstream dependency failed; --kill-on-invalid-dep=yes"
+    },
+    "78503": {
+      "id": "78503",
+      "script": "h2h_run.sbatch",
+      "submit_options": [
+        "--dependency=afterok:78502",
+        "--kill-on-invalid-dep=yes"
+      ],
+      "state": "CANCELLED",
+      "ended_at": "2026-10-17T20:13:08+08:00",
+      "reason": "upstream dependency failed; --kill-on-invalid-dep=yes"
+    }
+  },
+  "caption_recovery": {
+    "protocol": "cuhk-h2h-frozen-caption-2",
+    "default_decoding_unchanged": true,
+    "length_retry_repetition_penalties": [
+      1.1,
+      1.2
+    ],
+    "max_attempts": 3,
+    "max_output_tokens": 1000,
+    "truncated_outputs_accepted": false,
+    "persistent_failures_block_index": true,
+    "real_image_validation": "default reaches length at 1000 and 4000 tokens; repetition_penalty=1.1 stops normally at 188 tokens",
+    "tests_passed": 2,
+    "previous_captions_preserved": 11,
+    "artifacts": "recovery-20261017/",
+    "paper_exact_decoding_equivalence": false,
+    "live_validation": {
+      "original_11_rows_byte_preserved": true,
+      "validated_rows": 15,
+      "previously_failing_asset_recovered": true,
+      "recovered_asset_output_tokens": 164,
+      "recovered_asset_finish_reason": "stop",
+      "recovered_asset_repetition_penalty": 1.1
+    }
+  }
+}

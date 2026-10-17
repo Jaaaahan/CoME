@@ -113,6 +113,7 @@ def benchmark_commands(args: argparse.Namespace, config: dict[str, Any]) -> int:
             sys.executable, script("build_memix_checkpoints.py"),
             "--bundle", str(bundle), "--checkpoint-root", str(checkpoint),
             "--embedding-model", suite["embedding_model"], "--memix-repo", str(memix_repo),
+            "--backend", args.backend,
             "--memory-view", "derived", "--video-frames", "8",
         ]
         if args.dataset == "h2hmem":
@@ -124,6 +125,7 @@ def benchmark_commands(args: argparse.Namespace, config: dict[str, Any]) -> int:
             sys.executable, script("run_memix_main_track_retrieval.py"),
             "--bundle", str(bundle), "--checkpoint-root", str(checkpoint),
             "--embedding-model", suite["embedding_model"], "--memix-repo", str(memix_repo),
+            "--backend", args.backend,
             "--output", str(run_root / "atomic_retrieval.jsonl"),
             "--source-priors", str(priors), "--source-top-k", str(suite["source_top_k"]),
             "--processes", str(args.local_processes),
@@ -207,6 +209,7 @@ def benchmark_commands(args: argparse.Namespace, config: dict[str, Any]) -> int:
             sys.executable, script("run_memix_answers_from_retrieval.py"),
             "--bundle", str(bundle), "--retrieval", str(pruned),
             "--checkpoint-root", str(checkpoint), "--memix-repo", str(memix_repo),
+            "--backend", args.backend,
             "--output", str(predictions), "--base-url", args.base_url, "--model", model,
             "--concurrency", str(args.concurrency), "--max-model-len", str(suite["max_model_len"]),
             "--max-output-tokens", str(suite["reader_max_output_tokens"]),
@@ -268,6 +271,7 @@ def main() -> int:
     benchmark.add_argument("--artifact-root", type=Path, default=ROOT / "artifacts/graphmemix")
     benchmark.add_argument("--run-root", type=Path, default=ROOT / "runs/release/graphmemix")
     benchmark.add_argument("--memix-repo", type=Path)
+    benchmark.add_argument("--backend", choices=("memix", "standalone"), default="memix")
     benchmark.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     benchmark.add_argument("--model")
     benchmark.add_argument("--concurrency", type=int, default=4)
