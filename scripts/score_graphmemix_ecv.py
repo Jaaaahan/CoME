@@ -27,115 +27,15 @@ from graphmemix_core import (
 from mm_memory_bench.methods.backends import estimate_multimodal_input_tokens
 
 
-POSITIVE_ROLES = {"new_fact", "clarification", "corroboration"}
-ALL_ROLES = POSITIVE_ROLES | {"redundant", "conflict", "irrelevant"}
-ECV_PARSER_PROTOCOL = "graphmemix-ecv-structured-normalize-2"
+from mm_memory_bench.evidence_verifier import (
+    POSITIVE_ROLES, ALL_ROLES, ECV_PARSER_PROTOCOL, direct_support_value,
+    validate_candidate_rows, parse_json_object,
+)
 
-
-def direct_support_value(row: Mapping[str, Any], *, edge_only: bool) -> float:
-    """Enforce the edge-only contract in code, not merely in the prompt."""
-    if edge_only:
-        return 0.0
-    try:
-        return max(0.0, min(5.0, float(row.get("direct_support", 0.0))))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def validate_candidate_rows(
-    value: Any,
-    *,
-    expected_aliases: set[str],
-    eligible_anchors: Mapping[str, set[str]],
-) -> list[Mapping[str, Any]]:
-    """Reject incomplete, duplicate, or schema-invalid structured ECV rows."""
-    if not isinstance(value, list):
-        raise ValueError("ECV candidates must be a list")
-    rows: list[Mapping[str, Any]] = []
-    seen: set[str] = set()
-    ignored_unknown_rows = 0
-    for row in value:
-        if not isinstance(row, Mapping):
-            raise ValueError("ECV candidate row must be an object")
-        alias = str(row.get("id", ""))
-        if alias not in expected_aliases:
-            ignored_unknown_rows += 1
-            continue
-        if alias in seen:
-            raise ValueError(f"ECV returned duplicate candidate id: {alias!r}")
-        seen.add(alias)
-        role = str(row.get("role", "")).lower()
-        invalid_role = role not in ALL_ROLES
-        if invalid_role:
-            role = "irrelevant"
-        try:
-            direct = float(row.get("direct_support", 0.0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"ECV returned invalid direct support for {alias}") from exc
-        if not 0.0 <= direct <= 5.0:
-            raise ValueError(f"ECV direct support out of range for {alias}")
-        anchor = row.get("best_anchor_id")
-        ineligible_anchor = (
-            anchor is not None
-            and str(anchor) not in eligible_anchors.get(alias, set())
-        )
-        try:
-            incremental = float(row.get("incremental_support", 0.0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"ECV returned invalid incremental support for {alias}") from exc
-        if not 0.0 <= incremental <= 5.0:
-            raise ValueError(f"ECV incremental support out of range for {alias}")
-        normalized = dict(row)
-        normalizations: list[str] = []
-        if invalid_role:
-            normalized["role"] = "irrelevant"
-            normalizations.append("invalid_role_replaced_with_irrelevant")
-        if ineligible_anchor:
-            normalized["best_anchor_id"] = None
-            normalized["incremental_support"] = 0.0
-            normalized["role"] = "irrelevant"
-            normalizations.append("ineligible_anchor_cleared_edge_fields")
-        elif anchor is None and (incremental != 0.0 or role != "irrelevant"):
-            normalized["incremental_support"] = 0.0
-            normalized["role"] = "irrelevant"
-            normalizations.append("null_anchor_cleared_edge_fields")
-        elif role in POSITIVE_ROLES and incremental <= 0.0:
-            normalized["role"] = "irrelevant"
-            normalizations.append("zero_incremental_cleared_positive_role")
-        elif role not in POSITIVE_ROLES and incremental > 0.0:
-            normalized["incremental_support"] = 0.0
-            normalizations.append("nonpositive_role_cleared_incremental")
-        if normalizations:
-            normalized["_normalizations"] = normalizations
-        rows.append(normalized)
-    if seen != expected_aliases:
-        missing = sorted(expected_aliases - seen)
-        raise ValueError(f"ECV omitted {len(missing)} candidate rows: {missing[:3]}")
-    if ignored_unknown_rows and rows:
-        first = dict(rows[0])
-        first["_normalizations"] = [
-            *map(str, first.get("_normalizations", [])),
-            *(["ignored_unknown_candidate_row"] * ignored_unknown_rows),
-        ]
-        rows[0] = first
-    return rows
-
-
-def parse_json_object(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[-1]
-        text = text.rsplit("```", 1)[0].strip()
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        left, right = text.find("{"), text.rfind("}")
-        if left < 0 or right <= left:
-            raise
-        value = json.loads(text[left:right + 1])
-    if not isinstance(value, dict):
-        raise ValueError("verifier returned non-object JSON")
-    return value
+from mm_memory_bench.come.fields import ObservationSnapshot
+from mm_memory_bench.observation_evidence import rendering_contract, snippet_observation_ids
+from mm_memory_bench.memory_scope import visible_ids
+from mm_memory_bench.reader import BundleReader
 
 
 def modality_tags(memory: Mapping[str, Any]) -> list[str]:
@@ -257,6 +157,7 @@ def explicit_relations_from_memories(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--observations", type=Path)
     parser.add_argument("--candidate-cache", type=Path, required=True)
     parser.add_argument("--relation-store", type=Path)
     parser.add_argument(
@@ -311,7 +212,19 @@ def main() -> int:
 
     raw_questions = read_jsonl(args.bundle / "questions.jsonl", "question_id")
     memories = read_jsonl(args.bundle / "memories.jsonl", "memory_id")
+    observations = ObservationSnapshot.from_bundle(args.observations, BundleReader(args.bundle)) if args.observations else None
+    if observations:
+        memories = {mid: observations.attach(memory) for mid, memory in memories.items()}
+    evidence_contract = ({"observations": observations.contract, "observation_rendering": rendering_contract()}
+                         if observations else {})
     cached = read_jsonl(args.candidate_cache, "question_id")
+    questions_digest = file_sha256(args.bundle / "questions.jsonl") if observations else None
+    if any(row.get("observations") != (observations.contract if observations else None)
+           or (observations and row.get("observation_rendering") != rendering_contract())
+           for row in cached.values()):
+        raise ValueError("node scores and ECV use different observation snapshots or rendering")
+    if observations and any(row.get("observation_questions_sha256") != questions_digest for row in cached.values()):
+        raise ValueError("node scores use stale questions; regenerate node scores")
     incompatible_candidates = [
         qid for qid, row in cached.items()
         if row.get("memory_snippet_protocol") != MEMORY_SNIPPET_PROTOCOL
@@ -325,6 +238,10 @@ def main() -> int:
         read_jsonl(args.source_priors, "question_id")
         if args.source_priors is not None else {}
     )
+    if any(row.get("observations") != (observations.contract if observations else None) for row in priors.values()):
+        raise ValueError("source priors and ECV use different observation snapshots")
+    if observations and any(row.get("questions_sha256") != questions_digest for row in priors.values()):
+        raise ValueError("source priors use stale questions; regenerate priors")
     coefficients: dict[str, float] = {}
     if args.calibration is not None:
         calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
@@ -338,6 +255,8 @@ def main() -> int:
         else explicit_relations_from_memories(memories)
     )
     run_contract = {
+        **evidence_contract,
+        **({"observation_questions_sha256": questions_digest} if observations else {}),
         "memory_snippet_protocol": MEMORY_SNIPPET_PROTOCOL,
         "ecv_parser_protocol": ECV_PARSER_PROTOCOL,
         "ecv_model": args.model,
@@ -404,6 +323,8 @@ def main() -> int:
         source = cached[qid]
         query_text = visible_question_text(raw_questions[qid])
         candidate_ids = [str(value) for value in source["candidate_ids"]]
+        if not set(candidate_ids) <= visible_ids(raw_questions[qid], memories.values()):
+            raise ValueError("ECV candidates are outside the question memory scope")
         candidate_rank = {mid: index for index, mid in enumerate(candidate_ids)}
         verifier_scores = {
             str(mid): float(value)
@@ -472,7 +393,7 @@ def main() -> int:
                 "location": memory_location(memories[mid])[:120],
                 "snippet": memory_snippet(
                     memories[mid], args.snippet_chars,
-                    query=query_text, ocr_chars=args.ocr_chars,
+                    query=query_text, ocr_chars=args.ocr_chars, include_observations=observations is not None,
                 ),
                 "eligible_anchor_relations": options,
             })
@@ -489,6 +410,7 @@ def main() -> int:
                 "anchor_count": args.anchor_count, "snippet_chars": args.snippet_chars,
                 "ocr_chars": args.ocr_chars,
                 "edge_only": True, "anchor_mode": args.anchor_mode,
+                **({"observation_ids": {}} if observations else {}),
                 "memory_snippet_protocol": MEMORY_SNIPPET_PROTOCOL,
                 **{
                     key: value
@@ -539,7 +461,7 @@ def main() -> int:
                         "location": memory_location(memories[mid])[:120],
                         "snippet": memory_snippet(
                             memories[mid], args.snippet_chars,
-                            query=query_text, ocr_chars=args.ocr_chars,
+                            query=query_text, ocr_chars=args.ocr_chars, include_observations=observations is not None,
                         ),
                     }
                     for mid in anchors
@@ -655,6 +577,8 @@ def main() -> int:
             "finish_reason": ",".join(finish_reasons),
             "latency_seconds": time.perf_counter() - started,
             "anchor_count": args.anchor_count, "snippet_chars": args.snippet_chars,
+            **({"observation_ids": {mid: snippet_observation_ids(memories[mid], args.snippet_chars)
+                                    for mid in candidate_ids}} if observations else {}),
             "ocr_chars": args.ocr_chars,
             "eligible_edge_candidates": len(edge_candidates), "edge_only": args.edge_only,
             "anchor_mode": args.anchor_mode,

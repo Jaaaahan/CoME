@@ -24,6 +24,10 @@ from graphmemix_core import (
     memory_location, question_native_captions, read_jsonl, source_score_map,
 )
 
+from mm_memory_bench.come.fields import ObservationSnapshot
+from mm_memory_bench.observation_evidence import rendering_contract, snippet_observation_ids
+from mm_memory_bench.memory_scope import visible_ids
+
 
 def fold(question_id: str, folds: int = 5) -> int:
     digest = hashlib.sha256(question_id.encode("utf-8")).digest()
@@ -119,6 +123,7 @@ def caption_question_images(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--observations", type=Path)
     parser.add_argument("--source-priors", type=Path, required=True)
     parser.add_argument("--relation-store", type=Path, required=True)
     parser.add_argument("--graph-mode", choices=("none", "explicit", "full"), required=True)
@@ -182,13 +187,26 @@ def main() -> int:
     }
     resolved = {qid: _resolved_question(reader, row) for qid, row in raw_questions.items()}
     memories = read_jsonl(args.bundle / "memories.jsonl", "memory_id")
+    observations = ObservationSnapshot.from_bundle(args.observations, BundleReader(args.bundle)) if args.observations else None
+    if observations:
+        memories = {mid: observations.attach(memory) for mid, memory in memories.items()}
+    evidence_contract = ({"observations": observations.contract, "observation_rendering": rendering_contract()}
+                         if observations else {})
     priors = read_jsonl(args.source_priors, "question_id")
+    questions_digest = file_sha256(args.bundle / "questions.jsonl") if observations else None
+    for prior in priors.values():
+        if prior.get("observations") != (observations.contract if observations else None):
+            raise ValueError("source priors and verifier use different observation snapshots")
+        if observations and prior.get("questions_sha256") != questions_digest:
+            raise ValueError("source priors use stale questions; regenerate priors")
     candidate_override = (
         read_jsonl(args.candidate_override, "question_id")
         if args.candidate_override is not None else {}
     )
     adjacency = load_adjacency(args.relation_store, args.graph_mode, args.semantic_k)
     run_contract = {
+        **evidence_contract,
+        **({"observation_questions_sha256": questions_digest} if observations else {}),
         "memory_snippet_protocol": MEMORY_SNIPPET_PROTOCOL,
         "verifier_model": args.model,
         "graph_mode": args.graph_mode,
@@ -255,6 +273,7 @@ def main() -> int:
     def score(qid: str) -> dict[str, Any]:
         started = time.perf_counter()
         model = get_model()
+        visible = visible_ids(raw_questions[qid], memories.values())
         if candidate_override:
             if qid not in candidate_override:
                 raise KeyError(f"candidate override missing question_id={qid}")
@@ -272,8 +291,10 @@ def main() -> int:
         else:
             candidates = candidate_pool(
                 priors[qid], adjacency, source_top_l=args.source_top_l,
-                candidate_limit=args.candidate_limit,
+                candidate_limit=args.candidate_limit, visible_memory_ids=visible,
             )
+        if not set(candidates) <= visible:
+            raise ValueError("verifier candidates are outside the question memory scope")
         raw_scores = source_score_map(priors[qid])
         question = resolved[qid]
         query_text = question_text(question)
@@ -297,7 +318,7 @@ def main() -> int:
                 "retrieval_score": round(float(raw_scores.get(memory_id, min(raw_scores.values()) - 0.01)), 4),
                 "snippet": memory_snippet(
                     memories[memory_id], args.snippet_chars,
-                    query=query_text, ocr_chars=args.ocr_chars,
+                    query=query_text, ocr_chars=args.ocr_chars, include_observations=observations is not None,
                 ),
             } for memory_id in candidates],
             "instructions": [
@@ -347,6 +368,10 @@ def main() -> int:
                 memory_id = reverse_aliases[alias]
                 scores[memory_id] = max(scores.get(memory_id, 0.0), value)
         return {
+            **evidence_contract,
+            **({"observation_questions_sha256": run_contract["observation_questions_sha256"]} if observations else {}),
+            **({"observation_ids": {mid: snippet_observation_ids(memories[mid], args.snippet_chars)
+                                    for mid in candidates}} if observations else {}),
             "question_id": qid, "context_id": raw_questions[qid]["context_id"],
             "split": (
                 "dev" if fold(qid) == args.include_dev_fold

@@ -25,6 +25,9 @@ from mm_memory_bench.methods.backends import (
 from mm_memory_bench.methods.concrete_memix import ConcreteMemixMethod, _reader_data_url
 from mm_memory_bench.methods.media import question_text, uniformly_sample_video
 from mm_memory_bench.reader import BundleReader
+from mm_memory_bench.come.fields import ObservationSnapshot
+from mm_memory_bench.memory_scope import visible_ids
+from mm_memory_bench.observation_evidence import rendering_contract, render_observations, READER_OBSERVATION_CHARS
 from mm_memory_bench.methods.memory_backend import backend_hash, backend_contract
 from mm_memory_bench.core import resolve_asset_path
 
@@ -126,9 +129,14 @@ def hydrate_reader(
     reader_ocr_budget_chars: int = 0,
     video_frames_override: int = 0,
     backend: str = "memix",
+    observations: ObservationSnapshot | None = None,
 ) -> ConcreteMemixMethod:
     state = json.loads(checkpoint_state.read_text(encoding="utf-8"))
     config = dict(state.get("config", {}))
+    if observations:
+        observations.require_contract(config.get("observations"))
+    elif config.get("observations") is not None:
+        raise ValueError("enhanced reader requires its validated observation snapshot")
     expected_hash = str(config.get("core_sha256", ""))
     actual_hash = backend_hash(backend, memix_repo)
     if actual_hash != expected_hash:
@@ -151,9 +159,12 @@ def hydrate_reader(
         ),
         media_atomic_limit=int(config.get("media_atomic_limit", 0)),
         reader_ocr_budget_chars=reader_ocr_budget_chars,
+        observation_contract=config.get("observations"),
     )
     method.begin_context({"context_id": str(state["context_id"])})
     method._records = [dict(record) for record in state["records"]]
+    if observations:
+        method._records = [observations.attach({**r, "context_id": str(state["context_id"])}) for r in method._records]
     for record in method._records:
         source_id = public_source_ids.get(str(record["item_id"]))
         if source_id is not None:
@@ -366,6 +377,7 @@ def generate_text_only_answer(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--observations", type=Path)
     parser.add_argument("--retrieval", type=Path, required=True)
     parser.add_argument("--checkpoint-root", type=Path, required=True)
     parser.add_argument("--memix-repo", type=Path, default=Path("vendor/memix-core"))
@@ -489,8 +501,18 @@ def main() -> int:
 
     started = time.perf_counter()
     reader = BundleReader(args.bundle)
+    observations = ObservationSnapshot.from_bundle(args.observations, reader) if args.observations else None
+    source_memories = read_jsonl(args.bundle / "memories.jsonl", "memory_id")
     questions = read_jsonl(args.bundle / "questions.jsonl", "question_id")
     retrieval = read_jsonl(args.retrieval, "question_id")
+    questions_digest = hashlib.sha256((args.bundle / "questions.jsonl").read_bytes()).hexdigest() if observations else None
+    for qid, row in retrieval.items():
+        if qid in questions and not set(map(str, row.get("retrieved_memory_ids", []))) <= visible_ids(questions[qid], source_memories.values()):
+            raise ValueError("reader evidence is outside the question memory scope")
+        if row.get("metadata", {}).get("observations") != (observations.contract if observations else None):
+            raise ValueError("reader selection and sidecar use different observation snapshots")
+        if observations and row.get("metadata", {}).get("observation_questions_sha256") != questions_digest:
+            raise ValueError("reader selection uses stale questions; regenerate selection")
     unknown = set(retrieval) - set(questions)
     if unknown:
         raise ValueError(f"retrieval contains {len(unknown)} unknown question IDs")
@@ -551,6 +573,9 @@ def main() -> int:
         "reader_media_mode": args.reader_media_mode,
         **backend_contract(args.backend, args.memix_repo),
     }
+    if observations:
+        reader_contract.update(observations=observations.contract, observation_rendering=rendering_contract(),
+            observation_questions_sha256=questions_digest)
     if args.video_frames_override > 0:
         reader_contract["video_frames_override"] = args.video_frames_override
     if args.local_model:
@@ -560,6 +585,12 @@ def main() -> int:
         reader_contract["local_transport_sha256"] = hashlib.sha256(
             Path(local_qwen.__file__).read_bytes()
         ).hexdigest()
+    for path in states.values():
+        checkpoint_observations = json.loads(path.read_text())["config"].get("observations")
+        if observations:
+            observations.require_contract(checkpoint_observations)
+        elif checkpoint_observations is not None:
+            raise ValueError("enhanced checkpoints require --observations")
     state_hashes = {
         context_id: hashlib.sha256(path.read_bytes()).hexdigest()
         for context_id, path in states.items()
@@ -681,6 +712,7 @@ def main() -> int:
         for context_index, (context_id, rows) in enumerate(rows_by_context.items(), 1):
             method = hydrate_reader(
                 checkpoint_state=states[context_id],
+                observations=observations,
                 memix_repo=args.memix_repo,
                 backend=args.backend,
                 generation=generation,
@@ -829,6 +861,11 @@ def main() -> int:
                             "reader_tokenize_error": answer_model.last_tokenize_error,
                             "reader_run_contract": question_contract,
                         }
+                        if observations:
+                            result["observation_ids"] = {
+                                mid: render_observations(method._record_by_id[mid], max_chars=READER_OBSERVATION_CHARS)[1]
+                                for mid in evidence_ids}
+                            result["query_added_observations"] = 0
                         if overflow is not None:
                             result.update({
                                 "overflow_recovered": True,

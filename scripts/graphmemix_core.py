@@ -82,10 +82,13 @@ def load_adjacency(
 
 def candidate_pool(
     prior: Mapping[str, Any], adjacency: Mapping[str, Sequence[tuple[str, float, str]]],
-    *, source_top_l: int, candidate_limit: int,
+    *, source_top_l: int, candidate_limit: int, visible_memory_ids: set[str] | None = None,
 ) -> list[str]:
     """Keep Atomic top-L, then fill by edge confidence and parent source rank."""
-    source_ids = [str(value) for value in prior.get("retrieval_ids", [])]
+    if visible_memory_ids is None and "visible_memory_ids" in prior:
+        visible_memory_ids = set(map(str, prior["visible_memory_ids"]))
+    source_ids = [str(value) for value in prior.get("retrieval_ids", [])
+                  if visible_memory_ids is None or str(value) in visible_memory_ids]
     seeds = list(dict.fromkeys(source_ids[:source_top_l]))
     if candidate_limit < len(seeds):
         raise ValueError("candidate_limit must be at least source_top_l")
@@ -93,8 +96,10 @@ def candidate_pool(
     proposals: list[tuple[float, int, str]] = []
     for source_rank, seed in enumerate(seeds):
         for neighbor, similarity, _ in adjacency.get(seed, []):
-            if neighbor not in seen:
+            if neighbor not in seen and (visible_memory_ids is None or neighbor in visible_memory_ids):
                 proposals.append((-float(similarity), source_rank, neighbor))
+    if len(selected) >= candidate_limit:
+        return selected
     for _, _, neighbor in sorted(proposals):
         if neighbor in seen:
             continue
@@ -148,7 +153,7 @@ def memory_location(memory: Mapping[str, Any]) -> str:
     return str(metadata.get("location") or "")
 
 
-def memory_snippet(
+def _base_memory_snippet(
     memory: Mapping[str, Any],
     max_chars: int = 420,
     *,
@@ -203,6 +208,18 @@ def memory_snippet(
     if not semantic_budget:
         return ocr_block[:max_chars]
     return f"{semantic[:semantic_budget].rstrip()}\n{ocr_block}"[:max_chars]
+
+
+def memory_snippet(memory: Mapping[str, Any], max_chars: int = 420, *,
+                   query: str = "", ocr_chars: int = 120, include_observations: bool = False) -> str:
+    if not include_observations:
+        return _base_memory_snippet(memory, max_chars, query=query, ocr_chars=ocr_chars)
+    from mm_memory_bench.observation_evidence import render_observations, SNIPPET_OBSERVATION_CHARS
+    observations, _ = render_observations(memory, max_chars=min(SNIPPET_OBSERVATION_CHARS, max_chars * 3 // 4))
+    if not observations:
+        return _base_memory_snippet(memory, max_chars, query=query, ocr_chars=ocr_chars)
+    base = _base_memory_snippet(memory, max_chars - len(observations) - 1, query=query, ocr_chars=ocr_chars)
+    return "\n".join(value for value in (base, observations) if value)
 
 
 def question_native_captions(question: Mapping[str, Any]) -> list[str]:

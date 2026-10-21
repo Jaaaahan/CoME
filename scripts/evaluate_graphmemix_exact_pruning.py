@@ -157,6 +157,7 @@ def calibrated_prizes(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--observations", type=Path)
     parser.add_argument("--scores", type=Path, required=True)
     parser.add_argument("--ecv-scores", type=Path, required=True)
     parser.add_argument("--source-priors", type=Path, required=True)
@@ -169,6 +170,13 @@ def main() -> int:
     parser.add_argument("--edge-weight", type=float, default=0.1)
     parser.add_argument("--edge-power", type=float, default=1.0)
     args = parser.parse_args()
+    snapshot = None
+    if args.observations:
+        from mm_memory_bench.come.fields import ObservationSnapshot
+        from mm_memory_bench.reader import BundleReader
+        snapshot = ObservationSnapshot.from_bundle(args.observations, BundleReader(args.bundle))
+        from graphmemix_core import file_sha256
+        questions_digest = file_sha256(args.bundle / "questions.jsonl")
 
     calibration = json.loads(args.calibration.read_text(encoding="utf-8"))["coefficients"]
     a, b, c = (float(calibration[key]) for key in ("a", "b", "c"))
@@ -195,6 +203,14 @@ def main() -> int:
         output: dict[str, dict[str, Any]] = {}
         lengths: list[int] = []
         for qid in qids:
+            if snapshot:
+                if any(row.get("observation_questions_sha256") != questions_digest for row in (scores[qid], ecv[qid], retrieval[qid].get("metadata", {}))):
+                    raise ValueError("selection inputs use stale questions")
+                from mm_memory_bench.observation_evidence import rendering_contract
+                if any(row.get("observation_rendering") != rendering_contract() for row in (scores[qid], ecv[qid])):
+                    raise ValueError("selection inputs use stale observation rendering")
+                for row in (scores[qid], ecv[qid], priors[qid], retrieval[qid].get("metadata", {})):
+                    snapshot.require_contract(row.get("observations"))
             ids = [str(value) for value in retrieval[qid]["retrieved_memory_ids"]]
             prize = calibrated_prizes(
                 scores.get(qid), priors[qid], ids,
@@ -205,6 +221,11 @@ def main() -> int:
                 ids, prize, local_edges, edge_weight=args.edge_weight,
                 root_cost=root_cost, node_cost=node_cost,
             )
+            if snapshot:
+                from mm_memory_bench.come.types import digest
+                diagnostic.update(observations=snapshot.contract, observation_questions_sha256=questions_digest,
+                    pruning_inputs_sha256=digest([scores[qid], ecv[qid], priors[qid], retrieval[qid],
+                                                 calibration, args.edge_weight, args.edge_power, root_cost, node_cost]))
             output[qid] = {
                 "question_id": qid,
                 "context_id": retrieval[qid]["context_id"],

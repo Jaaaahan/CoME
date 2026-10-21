@@ -4,6 +4,12 @@ This document describes the frozen four-benchmark suite, the reusable artifact
 layout, the resumable execution stages, and the separate ATM-Bench-Hard
 extension.
 
+The default runner adds offline CoME observation fields to the original
+GraphMemix stages; see [the integration guide](come.md).
+For historical benchmark commands below, put
+`--config configs/release/graphmemix_legacy.json` before the subcommand. Published
+benchmark results and the ATM-Hard extension do not measure the observation extension.
+
 ## Benchmark suite
 
 | key | benchmark | evaluated questions |
@@ -20,7 +26,7 @@ the node verifier, ECV, and reader together:
 - `gemma4_12b`: `google/gemma-4-12B-it`
 
 The frozen execution contract is stored in
-`configs/release/graphmemix.json`. It contains candidate-generation, graph,
+`configs/release/graphmemix_legacy.json`. It contains candidate-generation, graph,
 solver, context, and evaluation parameters.
 
 ## Artifact layout

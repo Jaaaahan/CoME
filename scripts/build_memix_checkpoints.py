@@ -14,6 +14,7 @@ from mm_memory_bench.methods import (
     GenerationConfig,
 )
 from mm_memory_bench.reader import BundleReader
+from mm_memory_bench.come.fields import ObservationSnapshot
 
 
 class UnusedAnswerModel:
@@ -31,6 +32,7 @@ def main() -> int:
     parser.add_argument("--memix-repo", type=Path, default=Path("vendor/memix-core"))
     parser.add_argument("--backend", choices=("memix", "standalone"), default="memix")
     parser.add_argument("--caption-sidecar", type=Path)
+    parser.add_argument("--observations", type=Path)
     parser.add_argument("--memory-view", default="raw_derived")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--checkpoint-interval", type=int, default=100)
@@ -39,6 +41,7 @@ def main() -> int:
     args = parser.parse_args()
 
     reader = BundleReader(args.bundle, caption_sidecar=args.caption_sidecar)
+    observations = ObservationSnapshot.from_bundle(args.observations, reader) if args.observations else None
     embedder = GMEQwen2VLEmbedder(args.embedding_model)
     method = ConcreteMemixMethod(
         GenerationConfig(top_k=10),
@@ -48,6 +51,8 @@ def main() -> int:
         memix_repo=args.memix_repo,
         backend=args.backend,
         checkpoint_dir=args.checkpoint_root,
+        observation_contract=observations.contract if observations else None,
+        memory_view=args.memory_view,
         checkpoint_interval=args.checkpoint_interval,
         ingest_batch_size=args.batch_size,
         source_top_k=200,
@@ -61,7 +66,7 @@ def main() -> int:
         try:
             for memory_index, memory in enumerate(batch.memories, 1):
                 method.ingest(
-                    _resolved_memory(reader, memory, memory_view=args.memory_view)
+                    _resolved_memory(reader, memory, memory_view=args.memory_view, observations=observations)
                 )
                 if args.progress_interval > 0 and memory_index % args.progress_interval == 0:
                     print(json.dumps({

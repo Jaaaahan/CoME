@@ -3,10 +3,22 @@
   "method": "GraphMemix",
   "benchmark_suite": {
     "datasets": {
-      "atm": {"bundle": "atm_bench", "expected_questions": 1044},
-      "mem_gallery": {"bundle": "mem_gallery", "expected_questions": 1711},
-      "memeye": {"bundle": "memeye", "expected_questions": 1855},
-      "h2hmem": {"bundle": "h2hmem", "expected_questions": 1982}
+      "atm": {
+        "bundle": "atm_bench",
+        "expected_questions": 1044
+      },
+      "mem_gallery": {
+        "bundle": "mem_gallery",
+        "expected_questions": 1711
+      },
+      "memeye": {
+        "bundle": "memeye",
+        "expected_questions": 1855
+      },
+      "h2hmem": {
+        "bundle": "h2hmem",
+        "expected_questions": 1982
+      }
     },
     "backbones": {
       "qwen3vl8b": {
@@ -55,5 +67,19 @@
     "relation_store": "relation_store/{dataset}.jsonl",
     "caption_sidecar": "captions/{dataset}.jsonl",
     "memix_repo": "vendor/memix-core"
+  },
+  "pipeline": "graphmemix",
+  "come": {
+    "observations_per_image": 8,
+    "image_max_edge": 1280,
+    "text_chunk_chars": 800,
+    "use_crops": true
+  },
+  "observations": {
+    "enabled": true,
+    "max_model_len": 32768,
+    "max_output_tokens": 8192,
+    "model": "Qwen/Qwen3-VL-8B-Instruct",
+    "reasoning_effort": "none"
   }
 }

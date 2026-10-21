@@ -237,12 +237,16 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         verifier_input_mode: str = "query_caption",
         query_caption_cache_dir: str | Path | None = None,
         verifier_image_max_edge: int = 448,
+        observation_contract: Mapping[str, Any] | None = None,
+        memory_view: str | None = None,
     ) -> None:
         super().__init__(generation)
         if backend not in {"memix", "standalone"}:
             raise ValueError(f"unknown memory backend: {backend}")
         if backend == "standalone" and (use_llm_planner or use_llm_verify):
             raise ValueError("standalone mode does not implement the external Memix planner/verifier")
+        self.memory_view = memory_view
+        self.observation_contract = dict(observation_contract) if observation_contract is not None else None
         self.backend = backend
         if checkpoint_interval <= 0 or ingest_batch_size <= 0:
             raise ValueError("Memix checkpoint interval and ingest batch size must be positive")
@@ -512,7 +516,19 @@ class ConcreteMemixMethod(BaseMemoryMethod):
                 }
                 for chunk in _atomic_text_chunks(text, self.media_atomic_limit)
             )
-        return record, units  #record is a entire memory record, embedding unit is passed to form the embedding vector
+        field = memory.get("metadata", {}).get("come")
+        if self.observation_contract is not None:
+            if field is None:
+                raise ValueError("enhanced checkpoint needs a validated observation field for every memory")
+            from copy import deepcopy
+            record["metadata"]["come"] = deepcopy(field)
+            units.extend({"memory_id": memory_id, "text": obs["description"],
+                          "representation": "come_observation_text", "observation_id": obs["id"],
+                          "observation_version": obs["version"]}
+                         for obs in field["observations"])
+        elif field is not None:
+            raise ValueError("observation fields require an explicit checkpoint contract")
+        return record, units
 
     def _frame_path(self, memory_id: str, frame_index: int, frame: str) -> str:
         state_dir = self._state_dir()
@@ -533,7 +549,7 @@ class ConcreteMemixMethod(BaseMemoryMethod):
             item_class(
                 item_id=str(record["item_id"]),
                 modality=str(record["modality"]),
-                text=self._reader_text(record),
+                text=self._reader_text(record, include_observations=False),
                 image_path=Path(record["image_path"]) if record.get("image_path") else None,
                 video_path=Path(record["video_path"]) if record.get("video_path") else None,
                 metadata=dict(record.get("metadata", {})),
@@ -541,15 +557,19 @@ class ConcreteMemixMethod(BaseMemoryMethod):
             for record in self._records
         ]
 
-    def _reader_text(self, record: Mapping[str, Any], query: str = "") -> str:
+    def _reader_text(self, record: Mapping[str, Any], query: str = "", *, include_observations: bool = True) -> str:
         value = str(record["text"])
         if self.drop_reader_ocr:
-            return _without_ocr(value)
-        if self.reader_ocr_budget_chars:
-            return clean_labeled_ocr_block(
+            value = _without_ocr(value)
+        elif self.reader_ocr_budget_chars:
+            value = clean_labeled_ocr_block(
                 value, query=query, max_chars=self.reader_ocr_budget_chars
             )
-        return value
+        if not include_observations or self.observation_contract is None:
+            return value
+        from ..observation_evidence import render_observations, READER_OBSERVATION_CHARS
+        observations, _ = render_observations(record, max_chars=READER_OBSERVATION_CHARS)
+        return value + ("\n" + observations if observations else "")
 
     def _rebuild_memory_index(self) -> None:
         if self.backend == "standalone":
@@ -584,17 +604,46 @@ class ConcreteMemixMethod(BaseMemoryMethod):
             self.source_top_k * max(2, self.video_frames, self.media_atomic_limit),
             len(self._embedding_units),
         )
-        scores, rows = self.index.search(queries, per_query_k)
+        visible = question.get("visible_memory_ids")
+        visible = set(map(str, visible)) if visible is not None else None
+        enhanced = self.observation_contract is not None or any(
+            u.get("representation") == "come_observation_text" for u in self._embedding_units)
         best: dict[str, float] = {}
-        for query_scores, query_rows in zip(scores, rows):
-            for score, row in zip(query_scores, query_rows):
-                memory_id = str(self._embedding_units[int(row)]["memory_id"])
-                best[memory_id] = max(best.get(memory_id, -float("inf")), float(score))
+        hits: dict[str, dict[str, float]] = {}
+        while True:
+            scores, rows = self.index.search(queries, per_query_k)
+            best.clear()
+            hits.clear()
+            for query_scores, query_rows in zip(scores, rows):
+                for score, row in zip(query_scores, query_rows):
+                    if int(row) < 0:
+                        continue
+                    unit = self._embedding_units[int(row)]
+                    memory_id = str(unit["memory_id"])
+                    if visible is not None and memory_id not in visible:
+                        continue
+                    best[memory_id] = max(best.get(memory_id, -float("inf")), float(score))
+                    if unit.get("observation_id"):
+                        observed = hits.setdefault(memory_id, {})
+                        oid = unit["observation_id"]
+                        observed[oid] = max(observed.get(oid, -float("inf")), float(score))
+            if per_query_k == len(self._embedding_units) or not (enhanced or visible is not None):
+                break
+            if len(best) >= self.source_top_k:
+                cutoff = sorted(best.values(), reverse=True)[self.source_top_k - 1]
+                # Unfetched rows in every view must be below the current memory
+                # cutoff. Expand through ties so memory-ID ordering is stable.
+                if all(float(query_scores[-1]) < cutoff for query_scores in scores):
+                    break
+            per_query_k = min(len(self._embedding_units), max(per_query_k + 1, per_query_k * 2))
         ranked = sorted(best, key=lambda item_id: (-best[item_id], item_id))[: self.source_top_k]
-        return {
-            "retrieval_ids": ranked,
-            "retrieval_scores": [best[item_id] for item_id in ranked],
-        }
+        detail = {"retrieval_ids": ranked, "retrieval_scores": [best[item_id] for item_id in ranked]}
+        if enhanced:
+            detail["observation_hits"] = {
+                mid: [{"observation_id": oid, "score": score} for oid, score in
+                      sorted(hits.get(mid, {}).items(), key=lambda pair: (-pair[1], pair[0]))]
+                for mid in ranked if hits.get(mid)}
+        return detail
 
     def _answer(self, question: Mapping[str, Any]) -> MethodResult:
         self._flush_pending()
@@ -672,13 +721,20 @@ class ConcreteMemixMethod(BaseMemoryMethod):
     ) -> tuple[list[str], dict[str, Any]]:
         if self.backend == "standalone":
             detail = source_detail if source_detail is not None else self._source_detail(question)
-            selected = list(dict.fromkeys(map(str, detail["retrieval_ids"])))[:self.generation.top_k]
+            visible = question.get("visible_memory_ids")
+            selected = [mid for mid in dict.fromkeys(map(str, detail["retrieval_ids"]))
+                        if visible is None or mid in visible][:self.generation.top_k]
             if any(mid not in self._record_by_id for mid in selected):
                 raise ValueError("source priors reference memories outside the current context")
             return selected, {"backend": "standalone-dense-v1", "reranking": False}
         if self._memory_index is None:
             self._rebuild_memory_index()
-        if self._memory_index is None:
+        memory_index = self._memory_index
+        visible = question.get("visible_memory_ids")
+        if visible is not None:
+            items = [item for item in self._retrieval_items() if str(item.item_id) in visible]
+            memory_index = self.core.MemoryIndex.from_items(items, scope_mode="global") if items else None
+        if memory_index is None:
             selected_ids: list[str] = []
             filter_counts: dict[str, Any] = {}
         else:
@@ -703,7 +759,7 @@ class ConcreteMemixMethod(BaseMemoryMethod):
                         if source_detail is not None
                         else self._source_detail(question)
                     ),
-                    memory_index=self._memory_index,
+                    memory_index=memory_index,
                     scope_id="global",
                     client=self._local_client,
                     cache_dir=None,
@@ -883,6 +939,12 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         }
         # Preserve compatibility with existing baseline checkpoints when the
         # optional strategy is disabled.
+        if self.observation_contract is not None:
+            config["observations"] = self.observation_contract
+            config["observation_index"] = {
+                "memory_view": self.memory_view,
+                "embedding_model_identity": getattr(self.embedder, "model_identity", None),
+            }
         if self.media_atomic_limit:
             config["media_atomic_limit"] = self.media_atomic_limit
         if self.backend == "standalone":

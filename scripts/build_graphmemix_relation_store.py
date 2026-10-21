@@ -58,7 +58,7 @@ def normalize(vector: np.ndarray) -> np.ndarray:
 
 
 def canonical_unit_rows(units: Sequence[Mapping[str, Any]]) -> dict[str, list[int]]:
-    """Map each memory to canonical rows, excluding Atomic text auxiliaries."""
+    """Map each memory to canonical rows, excluding all auxiliary representations (including observations)."""
     result: dict[str, list[int]] = defaultdict(list)
     for row_id, unit in enumerate(units):
         if unit.get("representation"):
@@ -257,6 +257,7 @@ def mutual_neighbors(vectors: np.ndarray, max_k: int) -> list[tuple[int, int, in
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--observations", type=Path)
     parser.add_argument("--checkpoint-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -268,6 +269,12 @@ def main() -> int:
     parser.add_argument("--spatiotemporal-max-gap-seconds", type=float, default=0)
     parser.add_argument("--spatiotemporal-max-distance-meters", type=float, default=0)
     args = parser.parse_args()
+    if args.observations:
+        from mm_memory_bench.come.fields import ObservationSnapshot
+        from mm_memory_bench.reader import BundleReader
+        snapshot = ObservationSnapshot.from_bundle(args.observations, BundleReader(args.bundle))
+        for state_path in args.checkpoint_root.rglob("state.json"):
+            snapshot.require_contract(json.loads(state_path.read_text())["config"].get("observations"))
     if args.max_semantic_k <= 0:
         parser.error("--max-semantic-k must be positive")
     if not 0 < args.explicit_similarity <= 1:
@@ -361,6 +368,9 @@ def main() -> int:
         "semantic_edges": sum(row.get("semantic_similarity") is not None for row in rows),
         "contexts": context_summaries, "elapsed_seconds": time.perf_counter() - started,
     }
+    if args.observations:
+        summary["observations"] = snapshot.contract
+        summary["canonical_vector_protocol"] = "untagged-units-mean-1"
     summary_path = args.output.with_suffix(".summary.json")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"event": "complete", **summary}, ensure_ascii=False))

@@ -161,6 +161,7 @@ def hydrate_method(
         source_top_k=source_top_k,
         video_frames=video_frames,
         media_atomic_limit=media_atomic_limit,
+        observation_contract=config.get("observations"),
     )
     method.begin_context({"context_id": str(state["context_id"])})
     method._records = [dict(record) for record in state["records"]]
@@ -203,6 +204,7 @@ def hydrate_reranker(
         source_top_k=source_top_k,
         video_frames=int(config.get("video_frames", 8)),
         media_atomic_limit=int(config.get("media_atomic_limit", 0)),
+        observation_contract=config.get("observations"),
     )
     method.begin_context({"context_id": str(state["context_id"])})
     method._records = [dict(record) for record in state["records"]]

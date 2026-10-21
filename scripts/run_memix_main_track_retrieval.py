@@ -15,6 +15,8 @@ from mm_memory_bench.methods import (
     GMEQwen2VLEmbedder,
 )
 from mm_memory_bench.reader import BundleReader
+from mm_memory_bench.come.fields import ObservationSnapshot
+from mm_memory_bench.memory_scope import visible_ids
 from mm_memory_bench.methods.memory_backend import backend_hash, backend_contract
 
 from run_memix_retrieval_only import (
@@ -63,6 +65,7 @@ def main() -> int:
         description="Run clean Memix retrieval over a multi-context Main Track bundle."
     )
     parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--observations", type=Path)
     parser.add_argument("--checkpoint-root", type=Path, required=True)
     parser.add_argument("--embedding-model", type=Path, required=True)
     parser.add_argument("--memix-repo", type=Path, default=Path("vendor/memix-core"))
@@ -80,6 +83,7 @@ def main() -> int:
     started = time.perf_counter()
     allowed = read_ids(args.question_ids)
     reader = BundleReader(args.bundle)
+    observations = ObservationSnapshot.from_bundle(args.observations, reader) if args.observations else None
     batches = list(reader.iter_context_batches(question_ids=allowed))
     states = checkpoint_states(args.checkpoint_root)
     context_ids = {str(batch.context["context_id"]) for batch in batches}
@@ -89,6 +93,10 @@ def main() -> int:
     expected_core = backend_hash(args.backend, args.memix_repo)
     for context_id in context_ids:
         state = json.loads(states[context_id].read_text(encoding="utf-8"))
+        if observations:
+            observations.require_contract(state["config"].get("observations"))
+        elif state["config"].get("observations") is not None:
+            raise ValueError("enhanced checkpoints require --observations")
         actual = str(state.get("config", {}).get("core_sha256", ""))
         if actual != expected_core:
             raise RuntimeError(f"Memix core mismatch for {context_id}: {actual} != {expected_core}")
@@ -112,6 +120,8 @@ def main() -> int:
         "embedding_model_manifest_sha256": model_manifest_hash(args.embedding_model),
         "questions_sha256": file_hash(args.bundle / "questions.jsonl"),
     }
+    if observations:
+        base_contract["observations"] = observations.contract
     context_contracts: dict[str, dict[str, Any]] = {}
     for context_id in sorted(context_ids):
         state_path = states[context_id]
@@ -158,6 +168,11 @@ def main() -> int:
         )
 
     embedder = GMEQwen2VLEmbedder(args.embedding_model)
+    if observations:
+        for context_id in context_ids:
+            index_config = json.loads(states[context_id].read_text())["config"].get("observation_index", {})
+            if index_config.get("embedding_model_identity") != getattr(embedder, "model_identity", None):
+                raise ValueError("observation index embedding identity mismatch; rebuild checkpoint")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.source_priors.parent.mkdir(parents=True, exist_ok=True)
     output_mode = "a" if args.output.exists() else "w"
@@ -169,7 +184,8 @@ def main() -> int:
         for context_index, batch in enumerate(batches, 1):
             context_id = str(batch.context["context_id"])
             pairs = [
-                (raw, _resolved_question(reader, raw))
+                (raw, _resolved_question(reader, raw, visible_memory_ids=(
+                    visible_ids(raw, batch.memories) if raw.get("memory_scope", {}).get("mode", "all") != "all" else None)))
                 for raw in batch.questions
                 if str(raw["question_id"]) not in completed
             ]
@@ -203,6 +219,7 @@ def main() -> int:
                 cached = priors.get(question_id)
                 if cached is None:
                     query_started = time.perf_counter()
+                    scope = visible_ids(raw, batch.memories)
                     detail = method._source_detail(resolved)
                     cached = {
                         "question_id": question_id,
@@ -213,6 +230,10 @@ def main() -> int:
                         "public_source_ids": True,
                         **context_contracts[context_id],
                     }
+                    if raw.get("memory_scope", {}).get("mode", "all") != "all":
+                        cached["visible_memory_ids"] = sorted(scope)
+                    if observations:
+                        cached["observation_hits"] = detail.get("observation_hits", {})
                     append_jsonl(prior_handle, cached)
                     priors[question_id] = cached
                 details.append({

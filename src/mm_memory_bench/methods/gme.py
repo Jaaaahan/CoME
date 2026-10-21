@@ -33,10 +33,15 @@ class GMEQwen2VLEmbedder:
         except ImportError as exc:
             raise RuntimeError("torch and transformers are required for GME") from exc
         self.torch = torch
+        use_cuda = torch.cuda.is_available()
+        # This adapter runs one model per process. Managed pools can inject
+        # WORLD_SIZE without launching torchrun; "auto" then incorrectly enables
+        # tensor parallelism in Transformers. Respect the process's selected GPU.
+        device = torch.cuda.current_device() if use_cuda else "cpu"
         self.model = AutoModel.from_pretrained(
             model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto",
+            torch_dtype=torch.float16 if use_cuda else torch.float32,
+            device_map={"": device},
             trust_remote_code=True,
         ).eval()
         self._dimension = dimension

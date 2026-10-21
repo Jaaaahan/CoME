@@ -4,10 +4,13 @@ import json
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
 from .core import TOOL_SENSITIVE_KEYS, normalized_tool_key
 from .reader import BundleReader, ContextBatch
+
+if TYPE_CHECKING:
+    from .come.fields import ObservationSnapshot
 
 
 @runtime_checkable
@@ -154,6 +157,7 @@ def _resolved_memory(
     memory: Mapping[str, Any],
     *,
     memory_view: str = "raw",
+    observations: ObservationSnapshot | None = None,
 ) -> dict[str, Any]:
     allowed = {
         "memory_id",
@@ -187,6 +191,7 @@ def _resolved_memory(
     else:
         value["content"] = raw_content
     public_metadata = _public_metadata(memory)
+    public_metadata.pop("come", None)  # Extensions enter only through the validated snapshot below.
     if memory_view == "raw_derived":
         safe_derived = _safe_derived_metadata(
             memory, sidecar_captions=sidecar_captions
@@ -195,10 +200,13 @@ def _resolved_memory(
             public_metadata["derived"] = safe_derived
     if public_metadata:
         value["metadata"] = public_metadata
+    if observations is not None:
+        value = observations.attach(value)
     return value
 
 
-def _resolved_question(reader: BundleReader, question: Mapping[str, Any]) -> dict[str, Any]:
+def _resolved_question(reader: BundleReader, question: Mapping[str, Any], *,
+                       visible_memory_ids: set[str] | None = None) -> dict[str, Any]:
     allowed = {
         "question_id",
         "semantic_question_id",
@@ -209,6 +217,10 @@ def _resolved_question(reader: BundleReader, question: Mapping[str, Any]) -> dic
         "tool_mode",
     }
     value = {key: item for key, item in question.items() if key in allowed}
+    if visible_memory_ids is not None:
+        # Control information consumed by retrieval only; question_text and model
+        # message builders enumerate their own public fields explicitly.
+        value["visible_memory_ids"] = sorted(visible_memory_ids)
     value["prompt"] = _safe_content(reader, list(question["prompt"]))
     task = question.get("task")
     if isinstance(task, Mapping) and isinstance(task.get("response_type"), str):

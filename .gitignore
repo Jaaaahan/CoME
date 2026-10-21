@@ -30,6 +30,7 @@ EXPERIMENT_AUDIT.json
 /vendor
 /containers/wheels
 /cluster/cuhk-suite/logs/
+/cluster/cuhk-come/logs/
 Memix-core-share-*.tar.gz
 
 # Provider credentials and local endpoint configuration.
@@ -40,3 +41,6 @@ Memix-core-share-*.tar.gz
 # Official snapshots and generated bundles are intentionally local artifacts.
 /data/raw/
 /data/unified/
+
+/audit-report-20261019-112007
+/cluster

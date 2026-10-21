@@ -19,6 +19,13 @@ The repository provides the GraphMemix implementation, a unified benchmark
 harness, reproducible evaluation contracts, baseline adapters, and an
 ATM-Bench-Hard evidence-graph extension.
 
+The default runner uses **GraphMemix with offline CoME observations**. CoME
+extracts reusable details from source images; GraphMemix uses those fields in its
+existing memory-level retrieval, verification, forest selection, and reader.
+See [the CoME guide](docs/come.md) for interfaces, budgets, and evaluation.
+The results below describe the original GraphMemix release; its configuration
+is preserved in `configs/release/graphmemix_legacy.json`.
+
 ## 📰 Updates
 
 - **2026-08-27** — Paper released on [arXiv:2608.26983](https://arxiv.org/abs/2608.26983).
@@ -123,7 +130,7 @@ license before downloading or redistributing its data.
 
 ## 🚀 Run the Benchmark Suite
 
-Validate the frozen configuration:
+Validate the current configuration:
 
 ```bash
 python scripts/run_graphmemix_release.py validate-config
@@ -165,15 +172,16 @@ python scripts/run_graphmemix_release.py benchmark \
   --base-url http://127.0.0.1:8000/v1 \
   --judge-base-url https://YOUR-JUDGE-ENDPOINT/v1 \
   --judge-api-key-env JUDGE_API_KEY \
-  --from-stage node \
+  --from-stage reader \
   --to-stage judge
 ```
 
-Available stages are `checkpoint`, `priors`, `relations`, `node`, `ecv`,
-`select`, `prune`, `reader`, and `judge`. Model-stage outputs record their
-input contracts so incompatible cached rows cannot be silently reused. See
-[`docs/graphmemix_release.md`](docs/graphmemix_release.md) for the full
-artifact contract and stage behavior.
+The stages are `observations` (optional preprocessing), `checkpoint`, `priors`,
+`relations`, `node`, `ecv`, `select`, `prune`, `reader`, and `judge`. Queries read
+the frozen observations without extracting new ones or changing the index.
+Cached outputs record their input contracts so incompatible rows cannot be
+silently reused. See [the CoME guide](docs/come.md) for the current workflow and
+[the release guide](docs/graphmemix_release.md) for historical reproduction.
 
 ## 🧩 ATM-Bench-Hard Evidence-Graph Extension
 

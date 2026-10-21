@@ -58,6 +58,7 @@ def prizes(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--observations", type=Path)
     parser.add_argument("--ecv-scores", type=Path, required=True)
     parser.add_argument(
         "--question-reference", type=Path,
@@ -73,6 +74,13 @@ def main() -> int:
     parser.add_argument("--edge-power", type=float, action="append")
     parser.add_argument("--k", type=int, default=10)
     args = parser.parse_args()
+    snapshot = None
+    if args.observations:
+        from mm_memory_bench.come.fields import ObservationSnapshot
+        from mm_memory_bench.reader import BundleReader
+        snapshot = ObservationSnapshot.from_bundle(args.observations, BundleReader(args.bundle))
+        from graphmemix_core import file_sha256
+        questions_digest = file_sha256(args.bundle / "questions.jsonl")
     powers = args.edge_power or [1.0, 2.0]
     calibration = json.loads(args.calibration.read_text(encoding="utf-8"))["coefficients"]
     a, b, c = (float(calibration[key]) for key in ("a", "b", "c"))
@@ -103,6 +111,14 @@ def main() -> int:
             }
         else:
             erow = ecv[qid]
+        if snapshot:
+            if any(row.get("observation_questions_sha256") != questions_digest for row in (orow, erow)):
+                raise ValueError("selection inputs use stale questions")
+            from mm_memory_bench.observation_evidence import rendering_contract
+            if any(row.get("observation_rendering") != rendering_contract() for row in (orow, erow)):
+                raise ValueError("selection inputs use stale observation rendering")
+            for row in (orow, erow, priors[qid]):
+                snapshot.require_contract(row.get("observations"))
         ids = [str(value) for value in erow["candidate_ids"]]
         if ids != [str(value) for value in orow["candidate_ids"]]:
             raise ValueError(f"candidate mismatch for {qid}")
@@ -127,6 +143,11 @@ def main() -> int:
                 ids, node_prizes, adjacency, k=args.k,
                 edge_weight=args.edge_weight, root_cost=args.root_cost,
             )
+            if snapshot:
+                from mm_memory_bench.come.types import digest
+                diagnostic.update(observations=snapshot.contract, observation_questions_sha256=questions_digest,
+                    selection_inputs_sha256=digest([orow, erow, priors[qid], calibration, label,
+                                                   args.k, args.edge_weight, args.root_cost]))
             predictions[label][qid] = {
                 "question_id": qid, "context_id": erow["context_id"],
                 "retrieved_memory_ids": selected, "metadata": diagnostic,
