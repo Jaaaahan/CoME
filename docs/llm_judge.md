@@ -1,11 +1,11 @@
 # 统一 LLM Judge 评估
 
-当前正式统一评分协议为 `mmmb-llm-judge-1.1`。它统一“答案是否正确”的判断入口，但不会删除各数据集的原始 gold、官方指标或 scorer 信息，后续仍可重跑专属评估。
+当前正式统一评分协议为 `mmmb-llm-judge-1.3`。它统一“答案是否正确”的判断入口，但不会删除各数据集的原始 gold、官方指标或 scorer 信息，后续仍可重跑专属评估。
 
 ## 协议
 
 - judge 输入只有 question、公开 instruction、choices、response type、reference answer 和 prediction；不使用 evidence、私有 notes 或 memory 内容。
-- 固定 rubric、`temperature=0`，只允许返回 `{correct: boolean}` JSON；逐题记录不保存解释或原始模型回复。
+- 固定 rubric；兼容模型使用 `temperature=0`，GPT-5 系列不发送不支持的 `temperature` 参数。只允许返回 `{correct: boolean}` JSON；逐题记录不保存解释或原始模型回复。
 - 数字检查数值/单位/币种，列表检查完整性和多余项，choice 接受 ID 或无歧义文本，函数调用检查工具名、参数、依赖和 step 顺序。
 - 每条 judgment 保存 judge model、协议版本与 rubric SHA-256，便于锁定复现实验。
 - 同时报告物理记录 accuracy 和 `semantic_question_id` macro accuracy。后者避免 MemEye 的四个 MCQ rotation 获得不成比例的权重。
@@ -13,16 +13,29 @@
 
 ## 运行
 
-先用统一 harness 生成预测，然后调用任何 OpenAI-compatible chat endpoint：
+先用统一 harness 生成预测。首次使用 OpenAI 官方接口时，可将密钥保存在
+项目根目录的 `.env` 中，格式为 `OPENAI_API_KEY=<key>`，权限为 `600`。
+judge 会在未设置环境变量时自动读取它；环境变量优先。本地兼容服务和
+其他 API 地址不会自动读取这个文件。`.env` 已加入 Git 忽略列表。
 
 ```bash
-export OPENAI_API_KEY="..."
+cd /home/yuhan/come
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  install -m 600 /dev/null .env
+  printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" > .env
+else
+  echo '请先在当前终端设置 OPENAI_API_KEY'
+fi
+```
 
+之后直接运行：
+
+```bash
 PYTHONPATH=src python -m mm_memory_bench.cli judge \
   data/unified/memeye \
   runs/my_method/memeye.jsonl \
   --output runs/my_method/memeye.judgments.jsonl \
-  --model YOUR_LOCKED_JUDGE_MODEL \
+  --model gpt-5-mini \
   --concurrency 8
 ```
 

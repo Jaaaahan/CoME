@@ -1,11 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Mapping
+from unittest.mock import patch
 
 from mm_memory_bench.core import BundleWriter, content_text
-from mm_memory_bench.judge import judge_predictions
+from mm_memory_bench.judge import OpenAICompatibleJudge, backend_from_env, judge_predictions
 
 
 class FakeJudge:
@@ -22,6 +24,44 @@ class FakeJudge:
 
 
 class JudgeTest(unittest.TestCase):
+    def test_official_openai_judge_loads_project_env(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text("OPENAI_API_KEY=file-key\n", encoding="utf-8")
+            env_file.chmod(0o600)
+            with patch("mm_memory_bench.judge._project_env_path", return_value=env_file):
+                with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+                    backend = backend_from_env(model="gpt-5-mini", base_url="https://api.openai.com/v1",
+                                               api_key_env="OPENAI_API_KEY", timeout_seconds=120)
+            self.assertEqual(backend.api_key, "file-key")
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "env-key"}):
+                backend = backend_from_env(model="gpt-5-mini", base_url="https://api.openai.com/v1",
+                                           api_key_env="OPENAI_API_KEY", timeout_seconds=120)
+            self.assertEqual(backend.api_key, "env-key")
+            with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+                backend = backend_from_env(model="local-judge", base_url="http://127.0.0.1:8000/v1",
+                                           api_key_env="OPENAI_API_KEY", timeout_seconds=120)
+            self.assertIsNone(backend.api_key)
+            env_file.chmod(0o644)
+            with patch("mm_memory_bench.judge._project_env_path", return_value=env_file):
+                with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+                    with self.assertRaisesRegex(ValueError, "readable only by you"):
+                        backend_from_env(model="gpt-5-mini", base_url="https://api.openai.com/v1",
+                                         api_key_env="OPENAI_API_KEY", timeout_seconds=120)
+
+    def test_gpt5_mini_request_omits_unsupported_temperature(self) -> None:
+        response = json.dumps({"choices": [{"message": {"content": '{"correct": true}'}}]}).encode()
+        with patch("mm_memory_bench.judge.urllib.request.urlopen") as open_url:
+            open_url.return_value.__enter__.return_value.read.return_value = response
+            result = OpenAICompatibleJudge(model="gpt-5-mini", api_key="test-key").judge({"prediction": "yes"})
+            request = open_url.call_args.args[0]
+            body = json.loads(request.data)
+        self.assertEqual(result, {"correct": True})
+        self.assertEqual(body["model"], "gpt-5-mini")
+        self.assertNotIn("temperature", body)
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+
     def test_question_id_allowlist_limits_reporting_track(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

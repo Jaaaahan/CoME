@@ -104,7 +104,6 @@ class OpenAICompatibleJudge:
     def judge(self, item: Mapping[str, Any]) -> Mapping[str, Any]:
         body = {
             "model": self.model,
-            "temperature": 0,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": JUDGE_RUBRIC},
@@ -114,6 +113,10 @@ class OpenAICompatibleJudge:
                 },
             ],
         }
+        # GPT-5 family models reject temperature; older compatible judges use
+        # zero temperature for the existing evaluation protocol.
+        if not re.match(r"^gpt-5(?:$|[-.])", self.model):
+            body["temperature"] = 0
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -348,12 +351,29 @@ def backend_from_env(
     api_key_env: str,
     timeout_seconds: float,
 ) -> OpenAICompatibleJudge:
+    api_key = os.environ.get(api_key_env) or None
+    if not api_key and api_key_env == "OPENAI_API_KEY" and base_url.rstrip("/") == "https://api.openai.com/v1":
+        env_file = _project_env_path()
+        if env_file.exists() or env_file.is_symlink():
+            if env_file.is_symlink() or not env_file.is_file() or env_file.stat().st_mode & 0o077:
+                raise ValueError(f"Project .env must be a regular file readable only by you: {env_file}")
+            entries = [line.partition("=")[2].strip() for line in env_file.read_text(encoding="utf-8").splitlines()
+                       if line.strip().startswith("OPENAI_API_KEY=")]
+            if len(entries) != 1 or not entries[0] or entries[0][0] in "\"'" or any(c.isspace() for c in entries[0]):
+                raise ValueError(f"Project .env must contain one OPENAI_API_KEY=<key> line: {env_file}")
+            api_key = entries[0]
+        else:
+            raise ValueError(f"Set OPENAI_API_KEY or save it in {env_file}")
     return OpenAICompatibleJudge(
         model=model,
         base_url=base_url,
-        api_key=os.environ.get(api_key_env),
+        api_key=api_key,
         timeout_seconds=timeout_seconds,
     )
+
+
+def _project_env_path() -> Path:
+    return Path(__file__).resolve().parents[2] / ".env"
 
 
 __all__ = [
