@@ -122,6 +122,28 @@ python scripts/run_graphmemix_release.py validate-config
 
 当前集群可用 `scripts/prepare_observation_gpu_smoke.py` 准备固定的小样本与源码副本，再提交 `scripts/observation_gpu_smoke.sbatch`。该脚本依赖本工作区的 `cluster/cuhk-suite/{token_proxy.py,check_server.py,process_lifecycle.sh}` 和已有本地模型、Conda 环境；它不是发布包的通用部署入口。
 
+H2HMem 的三卡全量入口为 `scripts/h2hmem_3gpu.sbatch`：两卡 TP=2 运行
+Qwen3-VL-8B，一卡运行 GME 编码，提取与查询并发均为 2。使用项目主评测的
+1,982 题，保留全部 7,078 条记忆；准备时校验并复制已有的 1,300 张图片 caption。
+以下命令创建独立的源码、输入和输出目录，默认申请 12 CPU、64G 内存、48 小时：
+
+```bash
+export COME_FULL_ROOT="$PWD/.runtime-h2hmem-3gpu-$(date +%Y%m%d-%H%M%S)"
+PYTHONPATH=src:scripts /share/home/jyh/.conda/envs/graphmemix/bin/python \
+  scripts/prepare_observation_full_run.py \
+  --data-root /share/workspace3/yhjia/graphmemix --output "$COME_FULL_ROOT" \
+  --datasets h2hmem --gpus 3 \
+  --caption-sidecar /share/workspace3/yhjia/graphmemix/experiments/h2hmem-4090-20261017/artifacts/captions/h2hmem.jsonl
+sbatch --export=ALL --output="$COME_FULL_ROOT/h2hmem/logs/slurm-%j.log" \
+  "$COME_FULL_ROOT/source/scripts/h2hmem_3gpu.sbatch"
+```
+
+阶段和日志位于 `$COME_FULL_ROOT/h2hmem/phase.json`、`h2hmem/logs/`，
+回答位于 `h2hmem/runs/observations-v1/qwen3vl8b/h2hmem/reader/predictions.jsonl`。
+完成后自动检查离线产物未被查询修改，并在 `h2hmem/metrics/` 输出 H2H 原生
+Precision、Recall、F1、BLEU-1 和本地 Qwen 判分；本地判分不等同于论文的 GPT-5-mini 判分。
+旧作业结束后，可用同一 `COME_FULL_ROOT` 和冻结脚本重新提交续跑。
+
 ```bash
 export COME_SMOKE_ROOT="$PWD/.runtime-observation-smoke"
 PYTHONPATH=src:scripts /share/home/jyh/.conda/envs/graphmemix/bin/python \
