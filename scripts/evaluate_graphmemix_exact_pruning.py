@@ -15,6 +15,7 @@ import numpy as np
 
 from evaluate_atm_retrieval import memory_sessions, metrics_for, read_jsonl
 from graphmemix_core import missing_atomic_floor, source_score_map
+from mm_memory_bench.unit_evidence import UnitEvidenceCatalog, UNIT_EVIDENCE_PROTOCOL, selected_evidence_ids
 
 
 POSITIVE_ROLES = {"new_fact", "clarification", "corroboration"}
@@ -133,9 +134,10 @@ def calibrated_prizes(
     b: float,
     c: float,
     score_field: str,
+    unit_level: bool = False,
 ) -> dict[str, float]:
-    floor = missing_atomic_floor(prior_row)
-    source = source_score_map(prior_row)
+    floor = missing_atomic_floor(prior_row, unit_level=unit_level)
+    source = source_score_map(prior_row, unit_level=unit_level)
     if score_row is None:
         candidate_ids = list(requested_ids)
         atomic_scores = [source.get(memory_id) for memory_id in candidate_ids]
@@ -186,6 +188,8 @@ def main() -> int:
     retrieval = read_jsonl(args.retrieval, "question_id")
     questions = read_jsonl(args.bundle / "questions.jsonl", "question_id")
     sessions = memory_sessions(args.bundle / "memories.jsonl")
+    units = UnitEvidenceCatalog({mid: snapshot.attach(memory) for mid, memory in
+        read_jsonl(args.bundle / "memories.jsonl", "memory_id").items()}) if snapshot else None
     qids = sorted(set(priors) & set(retrieval) & set(questions))
     node_costs = args.node_cost if args.node_cost is not None else [0.0]
     root_costs = args.root_cost if args.root_cost is not None else [0.2]
@@ -207,14 +211,16 @@ def main() -> int:
                 if any(row.get("observation_questions_sha256") != questions_digest for row in (scores[qid], ecv[qid], retrieval[qid].get("metadata", {}))):
                     raise ValueError("selection inputs use stale questions")
                 from mm_memory_bench.observation_evidence import rendering_contract
-                if any(row.get("observation_rendering") != rendering_contract() for row in (scores[qid], ecv[qid])):
+                if any(row.get("observation_rendering") != rendering_contract() for row in (scores[qid], ecv[qid], retrieval[qid].get("metadata", {}))):
                     raise ValueError("selection inputs use stale observation rendering")
                 for row in (scores[qid], ecv[qid], priors[qid], retrieval[qid].get("metadata", {})):
                     snapshot.require_contract(row.get("observations"))
-            ids = [str(value) for value in retrieval[qid]["retrieved_memory_ids"]]
+            ids = selected_evidence_ids(retrieval[qid], unit_level=units is not None)
+            if units:
+                units.require(ids, questions[qid])
             prize = calibrated_prizes(
                 scores.get(qid), priors[qid], ids,
-                a=a, b=b, c=c, score_field=args.score_field,
+                a=a, b=b, c=c, score_field=args.score_field, unit_level=units is not None,
             )
             local_edges = positive_edges(ecv.get(qid, {}), set(ids), power=args.edge_power)
             selected, diagnostic = exact_subset(
@@ -224,12 +230,13 @@ def main() -> int:
             if snapshot:
                 from mm_memory_bench.come.types import digest
                 diagnostic.update(observations=snapshot.contract, observation_questions_sha256=questions_digest,
+                    evidence_identity=UNIT_EVIDENCE_PROTOCOL, observation_rendering=rendering_contract(),
                     pruning_inputs_sha256=digest([scores[qid], ecv[qid], priors[qid], retrieval[qid],
                                                  calibration, args.edge_weight, args.edge_power, root_cost, node_cost]))
             output[qid] = {
                 "question_id": qid,
                 "context_id": retrieval[qid]["context_id"],
-                "retrieved_memory_ids": selected,
+                **(units.selection(selected) if units else {"retrieved_memory_ids": selected}),
                 "metadata": diagnostic,
             }
             lengths.append(len(selected))

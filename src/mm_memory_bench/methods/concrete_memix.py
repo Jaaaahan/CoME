@@ -24,6 +24,8 @@ from .media import question_text, uniformly_sample_video
 from ..text_cleaning import clean_labeled_ocr_block
 from .vector_index import FaissFlatIPIndex, VectorIndex
 from .memory_backend import backend_hash
+from ..retrieval_units import observation_unit, unit_metadata
+from ..unit_evidence import evidence_identity
 
 
 @lru_cache(maxsize=512)
@@ -44,6 +46,26 @@ def _reader_data_url(path: str, max_edge: int = 0) -> str:
         image.save(buffer, format="JPEG", quality=90, optimize=True)
     payload = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/jpeg;base64,{payload}"
+
+
+@lru_cache(maxsize=512)
+def _reader_region_data_url(path: str, region: tuple[int, ...], size: tuple[int, ...], max_edge: int) -> str:
+    from PIL import Image
+    from .gme import _load_image
+
+    image = _load_image(path, region=region, expected_size=size)
+    if max_edge > 0:
+        image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=90, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _reader_image_url(part: Mapping[str, Any], max_edge: int = 0) -> str:
+    if part.get("image_region") is not None:
+        return _reader_region_data_url(str(part["path"]), tuple(part["image_region"]),
+                                       tuple(part["image_size"]), max_edge)
+    return _reader_data_url(str(part["path"]), max_edge)
 
 
 def _load_memix_core(repo: Path):
@@ -522,10 +544,7 @@ class ConcreteMemixMethod(BaseMemoryMethod):
                 raise ValueError("enhanced checkpoint needs a validated observation field for every memory")
             from copy import deepcopy
             record["metadata"]["come"] = deepcopy(field)
-            units.extend({"memory_id": memory_id, "text": obs["description"],
-                          "representation": "come_observation_text", "observation_id": obs["id"],
-                          "observation_version": obs["version"]}
-                         for obs in field["observations"])
+            units.extend(observation_unit(memory, obs) for obs in field["observations"])
         elif field is not None:
             raise ValueError("observation fields require an explicit checkpoint contract")
         return record, units
@@ -607,13 +626,15 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         visible = question.get("visible_memory_ids")
         visible = set(map(str, visible)) if visible is not None else None
         enhanced = self.observation_contract is not None or any(
-            u.get("representation") == "come_observation_text" for u in self._embedding_units)
+            u.get("observation_id") is not None for u in self._embedding_units)
         best: dict[str, float] = {}
         hits: dict[str, dict[str, float]] = {}
+        unit_hits: dict[str, dict[str, Any]] = {}
         while True:
             scores, rows = self.index.search(queries, per_query_k)
             best.clear()
             hits.clear()
+            unit_hits.clear()
             for query_scores, query_rows in zip(scores, rows):
                 for score, row in zip(query_scores, query_rows):
                     if int(row) < 0:
@@ -623,6 +644,11 @@ class ConcreteMemixMethod(BaseMemoryMethod):
                     if visible is not None and memory_id not in visible:
                         continue
                     best[memory_id] = max(best.get(memory_id, -float("inf")), float(score))
+                    if enhanced:
+                        metadata = unit_metadata(unit)
+                        uid = metadata["unit_id"]
+                        if uid not in unit_hits or float(score) > unit_hits[uid]["score"]:
+                            unit_hits[uid] = {**metadata, "score": float(score)}
                     if unit.get("observation_id"):
                         observed = hits.setdefault(memory_id, {})
                         oid = unit["observation_id"]
@@ -639,6 +665,10 @@ class ConcreteMemixMethod(BaseMemoryMethod):
         ranked = sorted(best, key=lambda item_id: (-best[item_id], item_id))[: self.source_top_k]
         detail = {"retrieval_ids": ranked, "retrieval_scores": [best[item_id] for item_id in ranked]}
         if enhanced:
+            retained = set(ranked)
+            detail["unit_hits"] = sorted(
+                (hit for hit in unit_hits.values() if hit["memory_id"] in retained),
+                key=lambda hit: (-hit["score"], hit["unit_id"]))
             detail["observation_hits"] = {
                 mid: [{"observation_id": oid, "score": score} for oid, score in
                       sorted(hits.get(mid, {}).items(), key=lambda pair: (-pair[1], pair[0]))]
@@ -869,7 +899,7 @@ class ConcreteMemixMethod(BaseMemoryMethod):
                 {
                     "type": "text",
                     "text": (
-                        f"Evidence {rank}; memory_id={memory_id}; "
+                        f"Evidence {rank}; {evidence_identity(record, memory_id)}; "
                         f"source_id={record.get('source_id')}; "
                         f"modality={record.get('modality', 'unknown')}:\n"
                         f"{self._reader_text(record, query=query)}"
@@ -882,9 +912,7 @@ class ConcreteMemixMethod(BaseMemoryMethod):
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": _reader_data_url(
-                                    str(part["path"]), image_max_edge
-                                )
+                                "url": _reader_image_url(part, image_max_edge)
                             },
                         }
                     )

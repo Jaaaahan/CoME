@@ -20,8 +20,12 @@ harness, reproducible evaluation contracts, baseline adapters, and an
 ATM-Bench-Hard evidence-graph extension.
 
 The default runner uses **GraphMemix with offline CoME observations**. CoME
-extracts reusable details from source images; GraphMemix uses those fields in its
-existing memory-level retrieval, verification, forest selection, and reader.
+extracts reusable details from source images; GraphMemix embeds each observation
+as a source-image crop plus its description. The original offline mutual-kNN
+graph now contains both memory and observation units. Queries use the original
+one-hop expansion over stored edges, starting from retrieved units. Selected units
+remain independent through verification, forest selection, pruning, and reading;
+parent memory IDs are retained for provenance and source-level evaluation.
 See [the CoME guide](docs/come.md) for interfaces, budgets, and evaluation.
 The results below describe the original GraphMemix release; its configuration
 is preserved in `configs/release/graphmemix_legacy.json`.

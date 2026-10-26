@@ -9,13 +9,32 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 
-def _load_image(value: str):
-    from PIL import Image
+def _load_image(value: str, *, region=None, expected_size=None):
+    from PIL import Image, ImageOps
 
     if value.startswith("data:"):
         payload = value.split(",", 1)[1]
-        return Image.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
-    return Image.open(value).convert("RGB")
+        source = io.BytesIO(base64.b64decode(payload))
+    else:
+        source = value
+    with Image.open(source) as original:
+        # Preserve existing whole-memory embeddings; observations explicitly use
+        # the oriented coordinate system exported by CoME.
+        image = (ImageOps.exif_transpose(original) if region is not None else original).convert("RGB")
+        if region is not None:
+            if expected_size is None or list(image.size) != list(expected_size):
+                raise ValueError("observation image size differs from oriented source")
+            if (len(region) != 4 or any(type(v) is not int for v in region) or
+                    not (0 <= region[0] < region[2] <= image.width and
+                         0 <= region[1] < region[3] <= image.height)):
+                raise ValueError("observation crop outside oriented image bounds")
+            image = image.crop(tuple(region))
+        return image
+
+
+def _unit_image(unit: Mapping[str, Any]):
+    return _load_image(str(unit["image"]), region=unit.get("image_region"),
+                       expected_size=unit.get("image_size"))
 
 
 class GMEQwen2VLEmbedder:
@@ -26,7 +45,14 @@ class GMEQwen2VLEmbedder:
         model_name: str = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct",
         *,
         dimension: int = 1536,
+        image_batch_size: int = 4,
     ) -> None:
+        if type(image_batch_size) is not int or image_batch_size < 1:
+            raise ValueError("image_batch_size must be a positive integer")
+        # An ingestion batch can contain many observation crops per memory.
+        # Bound the neural image batch separately from memory ingestion; GME's
+        # default of 32 images can exhaust a 24 GiB GPU at native resolution.
+        self.image_batch_size = image_batch_size
         try:
             import torch
             from transformers import AutoModel
@@ -90,13 +116,15 @@ class GMEQwen2VLEmbedder:
                             str(units[i].get("embedding_text", units[i].get("text", ""))).strip()
                             for i in ids
                         ],
-                        images=[_load_image(str(units[i]["image"])) for i in ids],
+                        images=[_unit_image(units[i]) for i in ids],
+                        batch_size=self.image_batch_size,
                     ),
                 ),
                 (
                     image_indices,
                     lambda ids: self.model.get_image_embeddings(
-                        images=[_load_image(str(units[i]["image"])) for i in ids]
+                        images=[_unit_image(units[i]) for i in ids],
+                        batch_size=self.image_batch_size,
                     ),
                 ),
                 (

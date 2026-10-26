@@ -23,6 +23,7 @@ from graphmemix_core import (
     memory_location,
     memory_snippet,
     read_jsonl,
+    source_score_map,
 )
 from mm_memory_bench.methods.backends import estimate_multimodal_input_tokens
 
@@ -36,6 +37,7 @@ from mm_memory_bench.come.fields import ObservationSnapshot
 from mm_memory_bench.observation_evidence import rendering_contract, snippet_observation_ids
 from mm_memory_bench.memory_scope import visible_ids
 from mm_memory_bench.reader import BundleReader
+from mm_memory_bench.unit_evidence import UnitEvidenceCatalog
 
 
 def modality_tags(memory: Mapping[str, Any]) -> list[str]:
@@ -100,19 +102,21 @@ class ChatClient:
         return str(value["choices"][0]["message"]["content"])
 
 
-def explicit_relations_from_store(path: Path) -> dict[str, dict[str, list[str]]]:
+def explicit_relations_from_store(path: Path, *, unit_level: bool = False) -> dict[str, dict[str, list[str]]]:
     result: dict[str, dict[str, list[str]]] = {}
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
             row = json.loads(line)
-            relations = [str(value) for value in row.get("explicit_relations", []) if value]
-            if not relations:
-                continue
-            left, right = str(row["left"]), str(row["right"])
-            result.setdefault(left, {})[right] = relations
-            result.setdefault(right, {})[left] = relations
+            edges = (row.get("edges", []) if row.get("record_type") == "unit_graph" else []) if unit_level else [row]
+            for edge in edges:
+                relations = [str(value) for value in edge.get("explicit_relations", []) if value]
+                if not relations:
+                    continue
+                left, right = str(edge["left"]), str(edge["right"])
+                result.setdefault(left, {})[right] = relations
+                result.setdefault(right, {})[left] = relations
     return result
 
 
@@ -215,6 +219,10 @@ def main() -> int:
     observations = ObservationSnapshot.from_bundle(args.observations, BundleReader(args.bundle)) if args.observations else None
     if observations:
         memories = {mid: observations.attach(memory) for mid, memory in memories.items()}
+    source_memories = memories
+    units = UnitEvidenceCatalog(memories) if observations else None
+    if units:
+        memories = units.records
     evidence_contract = ({"observations": observations.contract, "observation_rendering": rendering_contract()}
                          if observations else {})
     cached = read_jsonl(args.candidate_cache, "question_id")
@@ -250,10 +258,19 @@ def main() -> int:
             for key in ("a", "b", "c")
         }
     relations = (
-        explicit_relations_from_store(args.relation_store)
+        explicit_relations_from_store(args.relation_store, unit_level=units is not None)
         if args.relation_store is not None
-        else explicit_relations_from_memories(memories)
+        else explicit_relations_from_memories(source_memories)
     )
+    if units and args.relation_store is None:
+        from mm_memory_bench.retrieval_units import unit_identity
+        relations = {unit_identity(mid): {unit_identity(other): kinds for other, kinds in links.items()}
+                     for mid, links in relations.items()}
+        for uid, view in units.records.items():
+            if view.get("observation_id"):
+                parent = unit_identity(units.owners[uid])
+                relations.setdefault(uid, {})[parent] = ["belongs_to"]
+                relations.setdefault(parent, {})[uid] = ["belongs_to"]
     run_contract = {
         **evidence_contract,
         **({"observation_questions_sha256": questions_digest} if observations else {}),
@@ -323,7 +340,7 @@ def main() -> int:
         source = cached[qid]
         query_text = visible_question_text(raw_questions[qid])
         candidate_ids = [str(value) for value in source["candidate_ids"]]
-        if not set(candidate_ids) <= visible_ids(raw_questions[qid], memories.values()):
+        if not set(candidate_ids) <= (units.visible(raw_questions[qid]) if units else visible_ids(raw_questions[qid], memories.values())):
             raise ValueError("ECV candidates are outside the question memory scope")
         candidate_rank = {mid: index for index, mid in enumerate(candidate_ids)}
         verifier_scores = {
@@ -351,10 +368,7 @@ def main() -> int:
             )
         else:
             prior = priors[qid]
-            source_scores = dict(zip(
-                map(str, prior.get("retrieval_ids", [])),
-                map(float, prior.get("retrieval_scores", [])),
-            ))
+            source_scores = source_score_map(prior, unit_level=units is not None)
             floor = min(source_scores.values()) - 0.01
             a, b, c = (coefficients[key] for key in ("a", "b", "c"))
 
@@ -387,6 +401,7 @@ def main() -> int:
                 })
             candidates.append({
                 "id": aliases[mid],
+                **({"unit_id": mid, "source_memory_id": units.owners[mid]} if units else {}),
                 "is_atomic_anchor": mid in anchor_set,
                 "modalities": modality_tags(memories[mid]),
                 "date": str(memories[mid].get("timestamp", ""))[:10],

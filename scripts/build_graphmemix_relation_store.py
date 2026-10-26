@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build a query-independent GraphMemix RelationStore from frozen GME indexes.
+"""Build GraphMemix relation artifacts from frozen GME indexes.
+
+With CoME, apply the same offline mutual-kNN rule to memory and observation
+units. Queries traverse the stored edges without computing new neighbors.
 
 The first (non-atomic) embedding unit of a text/image memory is its canonical
 graph view.  Video memories have one such unit per sampled frame; their graph
@@ -254,6 +257,56 @@ def mutual_neighbors(vectors: np.ndarray, max_k: int) -> list[tuple[int, int, in
     return result
 
 
+def relation_rows(edges: Mapping[tuple[str, str], Mapping[str, Any]],
+                  explicit_similarity: float) -> list[dict[str, Any]]:
+    """Apply the original relation similarities and costs to either node type."""
+    rows = []
+    for key in sorted(edges):
+        row = dict(edges[key])
+        explicit_present = bool(row.get("explicit_relations"))
+        row["explicit_similarity"] = explicit_similarity if explicit_present else None
+        row["explicit_cost"] = -math.log(explicit_similarity) if explicit_present else None
+        similarity = row.get("semantic_similarity")
+        row["semantic_cost"] = (
+            -math.log(max(float(similarity), 1e-6))
+            if similarity is not None and float(similarity) > 0 else None
+        )
+        rows.append(row)
+    return rows
+
+
+def offline_unit_graph(index_path: Path, state: Mapping[str, Any], *,
+                       explicit: Mapping[tuple[str, str], Mapping[str, Any]],
+                       max_k: int, explicit_similarity: float) -> dict[str, Any]:
+    from mm_memory_bench.come.store import file_digest
+    from mm_memory_bench.retrieval_units import UNIT_GRAPH_PROTOCOL, unit_identity
+    from mm_memory_bench.unit_graph import reconstruct_unit_vectors
+
+    nodes, vectors = reconstruct_unit_vectors(index_path, state)
+    memory_ids = {node["memory_id"] for node in nodes}
+    edges = {}
+    for row in explicit.values():
+        if row["left"] in memory_ids and row["right"] in memory_ids:
+            left, right = sorted((unit_identity(row["left"]), unit_identity(row["right"])))
+            edges[(left, right)] = {**row, "left": left, "right": right}
+    for node in nodes:
+        if node["kind"] == "observation":
+            left, right = sorted((node["unit_id"], unit_identity(node["memory_id"])))
+            edges[(left, right)] = {"left": left, "right": right, "explicit_relations": ["belongs_to"]}
+    for i, j, left_rank, right_rank, similarity in mutual_neighbors(vectors, max_k):
+        left, right = nodes[i]["unit_id"], nodes[j]["unit_id"]
+        key = tuple(sorted((left, right)))
+        row = edges.setdefault(key, {"left": key[0], "right": key[1], "explicit_relations": []})
+        row.update({"semantic_similarity": max(-1., min(1., similarity)),
+                    "semantic_rank_left": left_rank if left == key[0] else right_rank,
+                    "semantic_rank_right": right_rank if right == key[1] else left_rank})
+    return {"record_type": "unit_graph", "protocol": UNIT_GRAPH_PROTOCOL,
+            "context_id": str(state["context_id"]), "units": nodes,
+            "edges": relation_rows(edges, explicit_similarity), "max_semantic_k": max_k,
+            "checkpoint_index_sha256": file_digest(index_path),
+            "observations": state["config"]["observations"]}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
@@ -302,6 +355,7 @@ def main() -> int:
     merge_explicit_edges(explicit, spatiotemporal)
     all_edges: dict[tuple[str, str], dict[str, Any]] = {key: dict(value) for key, value in explicit.items()}
     context_summaries: list[dict[str, Any]] = []
+    unit_graphs: list[dict[str, Any]] = []
     seen_memories: set[str] = set()
 
     state_paths = sorted(args.checkpoint_root.glob("contexts/*/state.json"))
@@ -310,6 +364,25 @@ def main() -> int:
     for state_path in state_paths:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         index_path = state_path.parent / str(state["index_file"])
+        if args.observations:
+            descriptor = offline_unit_graph(index_path, state, explicit=explicit,
+                                             max_k=args.max_semantic_k,
+                                             explicit_similarity=args.explicit_similarity)
+            memory_ids = {node["memory_id"] for node in descriptor["units"]}
+            if memory_ids - memories.keys():
+                raise ValueError("unit graph contains unknown canonical memories")
+            if any(str(memories[mid]["context_id"]) != str(state["context_id"]) for mid in memory_ids):
+                raise ValueError("unit graph contains memories from another context")
+            seen_memories.update(memory_ids)
+            unit_graphs.append(descriptor)
+            context_summaries.append({"context_id": str(state["context_id"]),
+                                      "memories": len(memory_ids), "units": len(descriptor["units"]),
+                                      "semantic_mutual_edges_max_k": sum(
+                                          e.get("semantic_similarity") is not None for e in descriptor["edges"])})
+            print(json.dumps({"event": "context", **context_summaries[-1]}), flush=True)
+            continue
+        if state["config"].get("observations") is not None:
+            raise ValueError("enhanced checkpoints require --observations")
         memory_ids, vectors = reconstruct_vectors(index_path, state)
         unknown = set(memory_ids) - memories.keys()
         if unknown:
@@ -336,23 +409,15 @@ def main() -> int:
     missing = memories.keys() - seen_memories
     if missing:
         raise ValueError(f"{len(missing)} bundle memories lack a canonical checkpoint vector")
-    rows: list[dict[str, Any]] = []
-    for key in sorted(all_edges):
-        row = all_edges[key]
-        explicit_present = bool(row.get("explicit_relations"))
-        row["explicit_similarity"] = args.explicit_similarity if explicit_present else None
-        row["explicit_cost"] = -math.log(args.explicit_similarity) if explicit_present else None
-        similarity = row.get("semantic_similarity")
-        row["semantic_cost"] = (
-            -math.log(max(float(similarity), 1e-6))
-            if similarity is not None and float(similarity) > 0 else None
-        )
-        rows.append(row)
+    rows = relation_rows(all_edges, args.explicit_similarity)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as handle:
+        for descriptor in unit_graphs:
+            handle.write(json.dumps(descriptor, ensure_ascii=False) + "\n")
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    graph_edges = [edge for descriptor in unit_graphs for edge in descriptor["edges"]] if args.observations else rows
     summary = {
         "protocol": "graphmemix-relation-store-1.0",
         "bundle": str(args.bundle), "checkpoint_root": str(args.checkpoint_root),
@@ -361,16 +426,19 @@ def main() -> int:
         "explicit_similarity": args.explicit_similarity,
         "spatiotemporal_max_gap_seconds": args.spatiotemporal_max_gap_seconds,
         "spatiotemporal_max_distance_meters": args.spatiotemporal_max_distance_meters,
-        "memories": len(memories), "edges": len(rows),
+        "memories": len(memories), "edges": len(graph_edges),
         "native_explicit_edges": native_explicit_count,
         "spatiotemporal_edges": len(spatiotemporal),
-        "explicit_edges": sum(bool(row.get("explicit_relations")) for row in rows),
-        "semantic_edges": sum(row.get("semantic_similarity") is not None for row in rows),
+        "explicit_edges": sum(bool(row.get("explicit_relations")) for row in graph_edges),
+        "semantic_edges": sum(row.get("semantic_similarity") is not None for row in graph_edges),
         "contexts": context_summaries, "elapsed_seconds": time.perf_counter() - started,
     }
     if args.observations:
+        from mm_memory_bench.retrieval_units import UNIT_GRAPH_PROTOCOL
         summary["observations"] = snapshot.contract
-        summary["canonical_vector_protocol"] = "untagged-units-mean-1"
+        summary["protocol"] = UNIT_GRAPH_PROTOCOL
+        summary["unit_graphs"] = len(unit_graphs)
+        summary["semantic_neighbors"] = "offline-mutual-knn"
     summary_path = args.output.with_suffix(".summary.json")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"event": "complete", **summary}, ensure_ascii=False))

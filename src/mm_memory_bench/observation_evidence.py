@@ -44,7 +44,9 @@ def render_observations(memory: Mapping[str, Any], *, max_chars: int,
 
 
 def rendering_contract() -> dict:
+    from .unit_evidence import UNIT_EVIDENCE_PROTOCOL
     return {"protocol": RENDER_PROTOCOL, "max_observations": MAX_OBSERVATIONS,
+            "evidence_identity": UNIT_EVIDENCE_PROTOCOL,
             "snippet_observation_chars": SNIPPET_OBSERVATION_CHARS,
             "reader_observation_chars": READER_OBSERVATION_CHARS,
             "ordering": "observation_id", "text_support": "complete-or-omit"}

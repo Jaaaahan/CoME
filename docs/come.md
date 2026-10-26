@@ -2,7 +2,7 @@
 
 CoME 只负责从原始来源提取、检查和保存与问题无关的观察。GraphMemix 继续负责向量召回、记忆图、节点验证、ECV、森林选择、剪枝和回答。实现依据是 [集成方案](come_graphmemix_integration_plan.md)。
 
-默认 `configs/release/graphmemix.json` 开启观察扩展；`graphmemix_legacy.json` 保留基线参数。两者使用相同的 `benchmark_suite`。已完成小样本 GPU 链路验证，尚无完整 benchmark 效果评测；原有发布结果不代表增强模式的效果。
+默认 `configs/release/graphmemix.json` 开启观察扩展；`graphmemix_legacy.json` 保留基线参数。两者的方法预算参数相同，Judge 协议分别为 1.3 和 1.2。2026-10-26 的修改限定为观察的区域图文编码，以及将 memory/observation 都作为图节点；继续采用原来的离线 mutual-kNN 和在线一跳邻接扩展。旧版完成过小样本 GPU 链路验证；本次修改通过 CPU 回归与真实 FAISS 链路验证，尚未重跑 GPU 或完整 benchmark。原有发布结果不代表新版效果。
 
 ## 模块边界
 
@@ -16,6 +16,8 @@ CoME 只负责从原始来源提取、检查和保存与问题无关的观察。
 | `come/fields.py:ObservationSnapshot` | 验证已完成快照，按 `context_id + memory_id` 挂载字段；接口只读。 |
 | `observation_evidence.py` | GraphMemix 的有界展示规则、来源文本展示及展示协议。 |
 | `methods/concrete_memix.py` | 追加观察向量表示、记忆级最高分合并、Reader 文本。 |
+| `retrieval_units.py`、`methods/gme.py` | 稳定 unit 身份、观察原图定位、EXIF 区域裁剪及图文联合编码。 |
+| `unit_graph.py`、`unit_evidence.py` | 重建 memory/observation 图向量，将实际命中 unit 接入原有候选算法，独立传递到评分、选择和 Reader。 |
 | `memory_scope.py` | GraphMemix 的 all/prefix/ids 可见范围。控制信息不进入问题文本。 |
 
 旧的查询实验保存在 `come/legacy_models.py`、`legacy_pipeline.py`、`legacy_runner.py`，以及旧 `retrieval.py`、`selection.py`、`packet.py` 中，用于历史回归。它们不在发布入口调用链中。`CoMEConfig` 是历史查询配置，不能传给新预处理入口。共享的 `evidence_forest.py`、`evidence_verifier.py` 继续供 GraphMemix 使用。
@@ -88,24 +90,43 @@ runs/release/graphmemix/observations-v1/{backbone}/{dataset}/
 
 ## GraphMemix 接入
 
-`_resolved_memory(..., observations=snapshot)` 在原有安全筛选后显式挂载已校验字段。`_adapt_memory()` 保持原有 `record.text` 和原有 embedding units，另加 `representation=come_observation_text` 的文本 units，记录观察 ID/版本。
+`_resolved_memory(..., observations=snapshot)` 在安全筛选后挂载已校验字段，并通过 `observation_source_images` 保存按原始内容位置解析的图像。即使 `derived` 视图移除了原图，观察仍能读取自己的原始来源，不能把改变后的内容位置当成来源位置。
 
-检索使用同一个 FAISS 索引，按 `memory_id` 取最大相似度。观察不独占候选名额。自适应扩大预取，直到各问题视图中剩余行均无法超过当前前 k 条记忆，或索引耗尽。`observation_hits` 只作诊断，不参与第二套排序。
+`_adapt_memory()` 保留原有记忆表示，为每条观察增加一个 `representation=come_observation_multimodal` unit：文本为 `description`，图像为来源图在 EXIF 纠正后的区域裁剪。多个区域使用联合包围框，保留区域之间的空间关系；一个观察始终对应一个向量。GME 调用 `get_fused_embeddings(texts, images)`，不再使用观察的纯文本 embedding。
 
-图仍是原始记忆图，使用原有种子和一跳邻居。所有带 `representation` 的附加 units 都被 canonical vector 构造排除。节点收益、ECV 端点、冻结校准参数、森林目标和剪枝规则保持记忆级语义。
+unit 身份是 JSON 编码的 `[memory_id, observation_id]`；完整记忆的第二项为 `null`。完整 memory 的多张图/视频帧是同一个逻辑 unit 的多个检索视图，构图向量使用原来的归一化均值；atomic text 仍属于该 memory。观察有独立向量，不混入父 memory 的均值。
+
+检索使用同一个 FAISS 索引，保留有序 `unit_hits`（unit ID、memory ID、类型、观察 ID/版本、分数）。原有 memory 级 source priors 仍按最高命中分数聚合并自适应预取，供来源级召回统计使用；图种子与后续评分直接使用 `unit_hits`，不会先将同一 memory 的观察压缩成一个根，也不会把父 memory 的最高分复制给所有观察。`observation_hits` 继续作为兼容诊断字段。
+
+`relations` 阶段继续对每个 context 的所有图节点执行原来的 `mutual_neighbors()`：排除自身，计算 top-k，仅在双方互为邻居时保存语义边及双方排名。变化仅是输入节点从 memory 扩展到 memory + observation。节点类型不改变排名规则，同属 memory 的观察也正常参与近邻排名。
+
+同轮次、相邻对话和可选时空关系仍连接完整 memory 节点；每个 observation 与父 memory 增加 `belongs_to` 显式关系，沿用原来的显式边权重。关系文件保存每个 context 的 unit 元数据、离线边和 checkpoint 摘要；ECV/森林读取 unit 边，原始 memory 显式关系记录仍保留供旧流程使用。
+
+node 阶段将 unit ID 直接传给原来的 `candidate_pool()`，不另写扩图算法：
+
+1. 根据召回分数取前 `source_top_l` 个实际命中的 unit，默认 24 个；同一 memory 的多个观察可以同时成为种子。
+2. 沿这些种子已经存储的边扩展一跳。语义边仍按双方排名过滤，默认 `semantic_k=8`；查询阶段不加载图向量索引、不重新搜索近邻。
+3. 按原有边相似度、种子排名和节点 ID 排序，对相同 unit ID 去重并补充至 `candidate_limit`，默认 48 个 unit。可见范围过滤、图模式和一跳限制沿用原逻辑；过滤后不重新计算邻居，不增加目标 memory 配额。
+4. 候选 unit 直接传给节点验证、ECV、森林选择和剪枝，再将选中的 unit 交给 Reader。同一 memory 的多个观察、以及完整 memory 本身均保留各自的 ID、分数和内容。node 缓存记录 `seed_unit_ids`、`candidate_unit_ids` 和图关系；父 memory 只出现在溯源元数据时，不自动成为候选或新的扩展根。
+
+因此，24/48 和最终选择的 k 都按 unit 计数。节点验证、ECV、森林和 Reader 的评分公式、选择算法保持不变。选择与剪枝输出的 `retrieved_unit_ids` 是后续唯一的证据输入，Reader 将它保存在预测的 `metadata.retrieved_unit_ids`。另存的 `retrieved_memory_ids` 只用于按原 benchmark 标注统计来源级召回，不参与下游选择或 agent 输入。关闭 observations 时继续使用原有 memory 图。
 
 建库、priors、关系构建、节点验证、ECV、选择、剪枝和 Reader 的脚本都接受 `--observations`。节点验证与 ECV 独立加载 sidecar；Reader 校验 checkpoint 的观察契约后重新挂载同一快照，支持正常多模态、text-only 和 action-aware 三种模式。
 
 ## 展示预算与缓存
 
 - verifier/ECV 保持每条证据总计 420 字符的默认预算。观察最多占 `min(300, 总预算×3/4)`，先保留观察所需空间，再渲染原有证据。
-- 每条记忆最多展示 4 个观察，按观察 ID 稳定排序。每个观察与其必要原文作为整体保留或省略，不截断后确认身份。
-- Reader 在原有文本之外最多加入 1200 字符观察，原有上下文窗口、输出预算、OCR 预算和图像输入策略不变。实际输入仍通过原有 token 检查。
-- 展示文本明确标记为模型观察，不是真值。节点/ECV 的 `observation_ids` 和 Reader 的 `metadata.observation_ids` 记录实际展示 ID；Reader 的 `query_added_observations` 为 0。
+- observation unit 仅展示自己的观察及必要来源原文，不附带父 memory 的其他文本或兄弟观察；完整 memory unit 保持原有内容，不自动拼入全部观察。每个观察与其必要原文作为整体保留或省略，不截断后确认身份。
+- Reader 对每个 observation unit 使用原有 1200 字符观察预算，并发送它的来源区域图像；text-only 模式只发送文本，action-aware 模式继续按原有 text/low/high 动作控制图像输入。原有上下文窗口、输出预算、OCR 预算和 token 检查保持不变。
+- 展示文本明确标记为模型观察，不是真值。节点/ECV 的 `observation_ids` 和 Reader 的 `metadata.observation_ids` 按 unit ID 记录实际展示的观察；Reader 的 `query_added_observations` 为 0。
 
-checkpoint 绑定观察契约、编码协议、embedding 身份和 memory view。priors 继续绑定 state/index 摘要；node/ECV 绑定观察快照和渲染协议；选择、剪枝记录输入摘要，Reader 绑定 checkpoint、选择记录、问题文件和渲染协议；judge 已按预测行摘要判断缓存。
+checkpoint 绑定观察契约、编码协议、embedding 身份和 memory view。当前编码协议为 `graphmemix-observation-region-description-2`，图协议为 `graphmemix-offline-unit-graph-2`。priors 绑定 state/index 摘要；unit 图校验观察契约及 prior 对应的 checkpoint 索引，防止混用不同向量空间。node/ECV 绑定关系文件摘要、观察快照和渲染协议，其中 `evidence_identity=graphmemix-unit-evidence-1` 区分独立 unit 与旧的父 memory 合并输入。选择、剪枝记录输入摘要，Reader 绑定 checkpoint、选择记录、问题文件和渲染协议；judge 已按预测行摘要判断缓存。
 
 不兼容缓存会明确拒绝续跑，请使用新产物路径重建受影响阶段。更换 embedding 不要求重做观察；修改源文件或提取设置则必须先生成新的观察快照。查询阶段不会调用提取或 grounding，不写观察，也不更新索引。
+
+从纯文本观察版本迁移时，可以复用原有 observations JSONL 和 manifest，但必须重建 checkpoint、priors、relations 及后续查询产物。如果已按上一版生成图文 checkpoint 和包含 `unit_hits` 的 priors，这两者可以复用，只需重建 relations 及之后的产物。之前“查询时计算邻居”的 `unit_index` 关系文件会被拒绝；新版关系文件不依赖额外的 `.units-*.faiss` 文件。
+
+如果已经具备当前图文 checkpoint、`unit_hits` priors 和离线 unit 图，本次取消父 memory 合并只需从 node 阶段重新运行至 Reader，离线产物可以复用。旧的 memory 级选择结果不会被当成 unit 选择结果读取。
 
 ## 验证与效果对照
 
@@ -114,7 +135,9 @@ PYTHONPATH=src:scripts python -m pytest -q tests
 python scripts/run_graphmemix_release.py validate-config
 ```
 
-`tests/test_observation_integration.py` 覆盖无问题文件预处理、来源校验、非方形和 EXIF 图像、重复观察召回、多个问题向量下的预取、canonical vectors、预算、可见范围、checkpoint 恢复、实际 node/ECV/Reader 消息、缓存拒绝及只读边界。模型调用使用确定性测试替身，向量保存和检索使用真实 FAISS。
+`tests/test_observation_integration.py` 覆盖无问题文件预处理、来源校验、非方形和 EXIF 图像、重复观察召回、多个问题向量下的预取、canonical vectors、预算、可见范围、checkpoint 恢复、实际 node/ECV/Reader 消息、缓存拒绝及只读边界。包含同一 memory 两个观察独立贯穿全部阶段的用例，并检查 Reader 三种模式中的独立内容、顺序、裁剪像素尺寸及跨机器资产路径重绑定。模型调用使用确定性测试替身，向量保存和检索使用真实 FAISS。
+
+`tests/test_gme_observation_encoding.py` 验证真实 GME 适配器的图文调用、正确源图及 EXIF 裁剪；`tests/test_unit_graph.py` 验证离线全节点 mutual-kNN、双方排名过滤、查询阶段禁止近邻搜索、复用原有 top-L/一跳候选算法、多观察种子、可见范围、父子归属和缓存不兼容拒绝。
 
 实际模型质量、Recall@200、候选 Recall@48、准确率和成本仍需在同一数据、模型、记忆视图、候选预算、上下文窗口和冻结系数下做 A/B 对照。观察描述中的错误会影响召回和证据判断，架构回归通过不代表效果提升。
 
@@ -159,7 +182,7 @@ PYTHONPATH=src:scripts /share/home/jyh/.conda/envs/graphmemix/bin/python \
 
 样本保留 Mem-Gallery、MemEye 各 3 个原始问题的标注证据和部分干扰记忆，共 26 条记忆、6 张图。选样使用了 gold evidence，因此不能把命中率或回答表现当作正式 benchmark 分数。测试使用 standalone 后端和原有 `derived` 视图，执行 observations 到 Reader，不调用外部 judge。
 
-审计检查观察与原始来源的契约、同一 FAISS 索引内的观察表示、记忆级 ID、canonical graph rows、各阶段覆盖率、真实 HTTP 消息中的观察，以及查询期间离线文件和索引逐字节不变。`structural_checks_passed` 仅表示这些检查通过，不表示每条模型观察语义正确。
+当前审计检查观察与原始来源的契约、图文 unit 和裁剪区域、独立的父 memory 向量、图索引的观察覆盖、实际命中 unit 到图根的对应关系、unit 级预算与下游身份传递、各阶段覆盖率、真实 HTTP 消息中的观察，以及查询期间原始离线文件和索引逐字节不变。`structural_checks_passed` 仅表示这些检查通过，不表示每条模型观察语义正确。以下 GPU 结果来自 2026-10-19 的旧版纯文本观察实现。
 
 2026-10-19 在 gpu03 的 3 张 RTX 4090 D 上完成两轮实测，作业 78875、78876 均正常退出，分别耗时 5 分 58 秒、5 分 42 秒。当前实现保留 39 条观察；试验性的更严格提取/grounding 提示词保留 22 条、拒绝 14 条。两轮都完成 6 个问题的全部阶段和结构审计，关闭服务后的预处理与 Reader 缓存续跑也通过。
 

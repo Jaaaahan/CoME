@@ -12,7 +12,8 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from evaluate_atm_retrieval import memory_sessions, metrics_for, read_jsonl
-from graphmemix_core import load_adjacency, missing_atomic_floor
+from graphmemix_core import load_adjacency, load_candidate_graph, missing_atomic_floor
+from mm_memory_bench.unit_evidence import UnitEvidenceCatalog, UNIT_EVIDENCE_PROTOCOL
 from probe_graphmemix_pcsf import solve_forest_greedy
 
 
@@ -90,7 +91,11 @@ def main() -> int:
     priors = read_jsonl(args.source_priors, "question_id")
     questions = read_jsonl(args.bundle / "questions.jsonl", "question_id")
     sessions = memory_sessions(args.bundle / "memories.jsonl")
-    fixed = load_adjacency(args.relation_store, "explicit", 8)
+    units = UnitEvidenceCatalog({mid: snapshot.attach(memory) for mid, memory in
+        read_jsonl(args.bundle / "memories.jsonl", "memory_id").items()}) if snapshot else None
+    fixed = (load_candidate_graph(args.relation_store, "explicit", 8,
+                                  observation_contract=snapshot.contract).adjacency
+             if snapshot else load_adjacency(args.relation_store, "explicit", 8))
     variants = ["original_fixed", "ecv_fixed", "atomic_only_fixed"]
     variants += [f"original_ecv_edge_p{power:g}" for power in powers]
     variants += [f"ecv_ecv_edge_p{power:g}" for power in powers]
@@ -120,10 +125,12 @@ def main() -> int:
             for row in (orow, erow, priors[qid]):
                 snapshot.require_contract(row.get("observations"))
         ids = [str(value) for value in erow["candidate_ids"]]
+        if units:
+            units.require(ids, questions[qid])
         if ids != [str(value) for value in orow["candidate_ids"]]:
             raise ValueError(f"candidate mismatch for {qid}")
         atomic_values = erow["atomic_scores"]
-        floor = missing_atomic_floor(priors[qid])
+        floor = missing_atomic_floor(priors[qid], unit_level=units is not None)
         original_prizes = prizes(ids, atomic_values, orow.get("verifier_scores", {}), floor=floor, a=a, b=b, c=c)
         ecv_prizes = prizes(ids, atomic_values, erow.get("direct_scores", {}), floor=floor, a=a, b=b, c=c)
         atomic_only_prizes = prizes(ids, atomic_values, {}, floor=floor, a=a, b=b, c=c)
@@ -146,11 +153,12 @@ def main() -> int:
             if snapshot:
                 from mm_memory_bench.come.types import digest
                 diagnostic.update(observations=snapshot.contract, observation_questions_sha256=questions_digest,
+                    evidence_identity=UNIT_EVIDENCE_PROTOCOL, observation_rendering=rendering_contract(),
                     selection_inputs_sha256=digest([orow, erow, priors[qid], calibration, label,
                                                    args.k, args.edge_weight, args.root_cost]))
             predictions[label][qid] = {
                 "question_id": qid, "context_id": erow["context_id"],
-                "retrieved_memory_ids": selected, "metadata": diagnostic,
+                **(units.selection(selected) if units else {"retrieved_memory_ids": selected}), "metadata": diagnostic,
             }
             diagnostics[label].append(diagnostic)
         if done % 100 == 0 or done == len(qids):

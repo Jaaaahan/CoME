@@ -57,6 +57,8 @@ tests/test_graphmemix_core.py
 tests/test_come.py
 tests/test_observation_integration.py
 tests/test_graphmemix_relation_store.py
+tests/test_unit_graph.py
+tests/test_gme_observation_encoding.py
 tests/test_graphmemix_pcsf.py
 tests/test_score_graphmemix_verifier.py
 tests/test_score_graphmemix_ecv.py

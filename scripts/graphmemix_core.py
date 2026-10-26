@@ -110,15 +110,62 @@ def candidate_pool(
     return selected
 
 
-def source_score_map(prior: Mapping[str, Any]) -> dict[str, float]:
+def load_candidate_graph(path: Path, mode: str, semantic_k: int, *,
+                         observation_contract: Mapping[str, Any] | None = None):
+    """Load the same offline edge rules at memory or memory/observation granularity."""
+    if observation_contract is None:
+        return load_adjacency(path, mode, semantic_k)
+    from mm_memory_bench.unit_graph import StoredUnitGraph
+    if mode not in {"none", "explicit", "full"}:
+        raise ValueError(f"unsupported graph mode: {mode}")
+    with path.open(encoding="utf-8") as handle:
+        descriptors = [row for line in handle if line.strip()
+                       if (row := json.loads(line)).get("record_type") == "unit_graph"]
+    adjacency: dict[str, list[tuple[str, float, str]]] = defaultdict(list)
+    for descriptor in descriptors:
+        for row in descriptor["edges"]:
+            similarity = edge_similarity(row, mode, semantic_k)
+            if similarity is None:
+                continue
+            relation = "semantic"
+            if row.get("explicit_relations") and float(row.get("explicit_similarity", 0.)) >= similarity:
+                relation = "belongs_to" if "belongs_to" in row["explicit_relations"] else "explicit"
+            left, right = str(row["left"]), str(row["right"])
+            adjacency[left].append((right, similarity, relation))
+            adjacency[right].append((left, similarity, relation))
+    for uid in adjacency:
+        adjacency[uid].sort(key=lambda value: (-value[1], value[0]))
+    return StoredUnitGraph(descriptors, dict(adjacency), semantic_k=semantic_k,
+                           observation_contract=observation_contract)
+
+
+def build_candidate_graph(prior, graph, *, source_top_l: int, candidate_limit: int,
+                          visible_memory_ids: set[str] | None = None) -> dict[str, Any]:
+    from mm_memory_bench.unit_graph import StoredUnitGraph
+    if isinstance(graph, StoredUnitGraph):
+        unit_prior, visible_units = graph.retrieval_prior(prior, visible_memory_ids)
+        selected = candidate_pool(unit_prior, graph.adjacency, source_top_l=source_top_l,
+                                  candidate_limit=candidate_limit, visible_memory_ids=visible_units)
+        return graph.project(selected, unit_prior["retrieval_ids"][:source_top_l])
+    return {"candidate_ids": candidate_pool(prior, graph, source_top_l=source_top_l,
+                                            candidate_limit=candidate_limit,
+                                            visible_memory_ids=visible_memory_ids)}
+
+
+def source_score_map(prior: Mapping[str, Any], *, unit_level: bool = False) -> dict[str, float]:
+    if unit_level:
+        if "unit_hits" not in prior:
+            raise ValueError("unit-level scoring requires unit hits; regenerate priors")
+        return {str(hit["unit_id"]): float(hit["score"]) for hit in prior["unit_hits"]}
     ids = [str(value) for value in prior.get("retrieval_ids", [])]
     scores = [float(value) for value in prior.get("retrieval_scores", [])]
     return dict(zip(ids, scores))
 
 
-def missing_atomic_floor(prior: Mapping[str, Any]) -> float:
+def missing_atomic_floor(prior: Mapping[str, Any], *, unit_level: bool = False) -> float:
     """Return the frozen floor for graph neighbors absent from source retrieval."""
-    scores = [float(value) for value in prior.get("retrieval_scores", [])]
+    scores = (list(source_score_map(prior, unit_level=True).values()) if unit_level else
+              [float(value) for value in prior.get("retrieval_scores", [])])
     if not scores:
         raise ValueError("source prior has no retrieval scores")
     return min(scores) - 0.01

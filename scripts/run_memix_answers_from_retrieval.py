@@ -2,7 +2,7 @@
 """Generate canonical Memix answers from an immutable retrieval JSONL.
 
 This deliberately bypasses retrieval: every answer is conditioned on the
-ordered ``retrieved_memory_ids`` already recorded by a retrieval experiment.
+ordered selected unit IDs (or legacy memory IDs) recorded by a retrieval experiment.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from mm_memory_bench.methods.backends import (
     OpenAICompatibleQwenVL,
     openai_tools,
 )
-from mm_memory_bench.methods.concrete_memix import ConcreteMemixMethod, _reader_data_url
+from mm_memory_bench.methods.concrete_memix import ConcreteMemixMethod, _reader_data_url, _reader_image_url
 from mm_memory_bench.methods.media import question_text, uniformly_sample_video
 from mm_memory_bench.reader import BundleReader
 from mm_memory_bench.come.fields import ObservationSnapshot
@@ -30,6 +30,9 @@ from mm_memory_bench.memory_scope import visible_ids
 from mm_memory_bench.observation_evidence import rendering_contract, render_observations, READER_OBSERVATION_CHARS
 from mm_memory_bench.methods.memory_backend import backend_hash, backend_contract
 from mm_memory_bench.core import resolve_asset_path
+from mm_memory_bench.unit_evidence import (
+    UnitEvidenceCatalog, selected_evidence_ids, reader_unit_records, evidence_identity,
+)
 
 from run_memix_retrieval_only import (
     UnusedEmbedder,
@@ -184,6 +187,9 @@ def hydrate_reader(
     method._record_by_id = {
         str(record["item_id"]): record for record in method._records
     }
+    if observations:
+        method._record_by_id.update(reader_unit_records(
+            method._records, state["embedding_units"], public_asset_paths))
     # Fixed-evidence answer generation reads only ``_record_by_id``. Building
     # the full Memix retrieval index here can take minutes for large contexts
     # and is both unused and semantically irrelevant to the reader prompt.
@@ -230,9 +236,9 @@ def representation_actions(retrieval_row: Mapping[str, Any]) -> dict[str, str]:
     rows = metadata.get("selected_actions", []) if isinstance(metadata, Mapping) else []
     actions: dict[str, str] = {}
     for row in rows:
-        if not isinstance(row, Mapping) or not row.get("memory_id"):
+        if not isinstance(row, Mapping) or not row.get("unit_id", row.get("memory_id")):
             continue
-        memory_id = str(row["memory_id"])
+        memory_id = str(row.get("unit_id", row.get("memory_id")))
         action = str(row.get("action", ""))
         if action not in {"text", "low", "high"}:
             raise ValueError(f"invalid representation action {action!r} for {memory_id}")
@@ -295,7 +301,7 @@ def generate_action_aware_answer(
         evidence_content.append({
             "type": "text",
             "text": (
-                f"Evidence {rank}; memory_id={memory_id}; "
+                f"Evidence {rank}; {evidence_identity(record, memory_id)}; "
                 f"source_id={record.get('source_id')}; "
                 f"modality={record.get('modality', 'unknown')}:\n"
                 f"{method._reader_text(record, query=question_text(question))}"
@@ -309,7 +315,7 @@ def generate_action_aware_answer(
                 evidence_content.append({
                     "type": "image_url",
                     "image_url": {
-                        "url": _reader_data_url(str(part["path"]), image_edge)
+                        "url": _reader_image_url(part, image_edge)
                     },
                 })
             elif part.get("type") == "video" and part.get("path"):
@@ -355,7 +361,7 @@ def generate_text_only_answer(
     for rank, memory_id in enumerate(evidence_ids, 1):
         record = method._record_by_id[memory_id]
         evidence.append(
-            f"Evidence {rank}; memory_id={memory_id}; "
+            f"Evidence {rank}; {evidence_identity(record, memory_id)}; "
             f"source_id={record.get('source_id')}; "
             f"modality={record.get('modality', 'unknown')}:\n"
             f"{method._reader_text(record, query=query)}"
@@ -503,16 +509,22 @@ def main() -> int:
     reader = BundleReader(args.bundle)
     observations = ObservationSnapshot.from_bundle(args.observations, reader) if args.observations else None
     source_memories = read_jsonl(args.bundle / "memories.jsonl", "memory_id")
+    units = UnitEvidenceCatalog({mid: observations.attach(memory) for mid, memory in source_memories.items()}) if observations else None
     questions = read_jsonl(args.bundle / "questions.jsonl", "question_id")
     retrieval = read_jsonl(args.retrieval, "question_id")
     questions_digest = hashlib.sha256((args.bundle / "questions.jsonl").read_bytes()).hexdigest() if observations else None
     for qid, row in retrieval.items():
-        if qid in questions and not set(map(str, row.get("retrieved_memory_ids", []))) <= visible_ids(questions[qid], source_memories.values()):
+        evidence_ids = selected_evidence_ids(row, unit_level=units is not None)
+        if units and qid in questions:
+            units.require(evidence_ids, questions[qid])
+        if not units and qid in questions and not set(evidence_ids) <= visible_ids(questions[qid], source_memories.values()):
             raise ValueError("reader evidence is outside the question memory scope")
         if row.get("metadata", {}).get("observations") != (observations.contract if observations else None):
             raise ValueError("reader selection and sidecar use different observation snapshots")
         if observations and row.get("metadata", {}).get("observation_questions_sha256") != questions_digest:
             raise ValueError("reader selection uses stale questions; regenerate selection")
+        if observations and row.get("metadata", {}).get("observation_rendering") != rendering_contract():
+            raise ValueError("reader selection uses stale unit evidence rendering; regenerate selection")
     unknown = set(retrieval) - set(questions)
     if unknown:
         raise ValueError(f"retrieval contains {len(unknown)} unknown question IDs")
@@ -541,9 +553,9 @@ def main() -> int:
         return length == 10
 
     invalid = {
-        question_id: len(row.get("retrieved_memory_ids", []))
+        question_id: len(selected_evidence_ids(row, unit_level=units is not None))
         for question_id, row in retrieval.items()
-        if not valid_length(len(row.get("retrieved_memory_ids", [])))
+        if not valid_length(len(selected_evidence_ids(row, unit_level=units is not None)))
     }
     if invalid:
         preview = list(invalid.items())[:5]
@@ -604,8 +616,8 @@ def main() -> int:
         if retrieval_row is None or question is None:
             incompatible_completed.append(question_id)
             continue
-        expected_ids = [str(value) for value in retrieval_row.get("retrieved_memory_ids", [])]
-        actual_ids = [str(value) for value in row.get("retrieved_memory_ids", [])]
+        expected_ids = selected_evidence_ids(retrieval_row, unit_level=units is not None)
+        actual_ids = list(map(str, row.get("metadata", {}).get("retrieved_unit_ids", []))) if units else list(map(str, row.get("retrieved_memory_ids", [])))
         metadata = row.get("metadata", {})
         stored_contract = (
             metadata.get("reader_run_contract", {})
@@ -755,7 +767,7 @@ def main() -> int:
                         )
                         if value
                     )
-                evidence_ids = [str(value) for value in retrieval_row["retrieved_memory_ids"]]
+                evidence_ids = selected_evidence_ids(retrieval_row, unit_level=units is not None)
                 actions = (
                     representation_actions(retrieval_row)
                     if args.respect_selected_actions else {}
@@ -771,6 +783,7 @@ def main() -> int:
                         {
                             "prediction": "",
                             "retrieved_memory_ids": [],
+                            **({"retrieved_unit_ids": []} if units else {}),
                             "status": "error",
                             "error_type": "OriginalMethodError",
                             "error": method_error[:2000],
@@ -849,7 +862,7 @@ def main() -> int:
                                 )
                         result = {
                             "prediction": prediction,
-                            "retrieved_memory_ids": evidence_ids,
+                            **(units.selection(evidence_ids) if units else {"retrieved_memory_ids": evidence_ids}),
                             "retrieval_metadata": retrieval_row.get("metadata", {}),
                             "retrieval_latency_seconds": retrieval_row.get("latency_seconds"),
                             "answer_attempts": attempt,
@@ -932,6 +945,7 @@ def main() -> int:
                                     "retrieved_memory_ids": retrieval_row[
                                         "retrieved_memory_ids"
                                     ],
+                                    **({"retrieved_unit_ids": selected_evidence_ids(retrieval_row, unit_level=True)} if units else {}),
                                     "status": "error",
                                     "error_type": type(exc).__name__,
                                     "error": error[:2000],

@@ -15,7 +15,7 @@ BBox = tuple[int, int, int, int]
 # invalidate a reusable observation snapshot.
 OBSERVATION_SCHEMA_VERSION = 1
 OBSERVATION_PROTOCOL = "come-observation-field-1"
-OBSERVATION_ENCODING_PROTOCOL = "graphmemix-observation-description-1"
+OBSERVATION_ENCODING_PROTOCOL = "graphmemix-observation-region-description-2"
 
 
 @dataclass(frozen=True)

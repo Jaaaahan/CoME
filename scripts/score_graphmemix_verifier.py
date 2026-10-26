@@ -20,13 +20,14 @@ from mm_memory_bench.methods.media import question_text
 from mm_memory_bench.reader import BundleReader
 
 from graphmemix_core import (
-    MEMORY_SNIPPET_PROTOCOL, candidate_pool, file_sha256, load_adjacency, memory_snippet,
+    MEMORY_SNIPPET_PROTOCOL, build_candidate_graph, file_sha256, load_candidate_graph, memory_snippet,
     memory_location, question_native_captions, read_jsonl, source_score_map,
 )
 
 from mm_memory_bench.come.fields import ObservationSnapshot
 from mm_memory_bench.observation_evidence import rendering_contract, snippet_observation_ids
 from mm_memory_bench.memory_scope import visible_ids
+from mm_memory_bench.unit_evidence import UnitEvidenceCatalog
 
 
 def fold(question_id: str, folds: int = 5) -> int:
@@ -190,6 +191,10 @@ def main() -> int:
     observations = ObservationSnapshot.from_bundle(args.observations, BundleReader(args.bundle)) if args.observations else None
     if observations:
         memories = {mid: observations.attach(memory) for mid, memory in memories.items()}
+    source_memories = memories
+    units = UnitEvidenceCatalog(memories) if observations else None
+    if units:
+        memories = units.records
     evidence_contract = ({"observations": observations.contract, "observation_rendering": rendering_contract()}
                          if observations else {})
     priors = read_jsonl(args.source_priors, "question_id")
@@ -203,7 +208,8 @@ def main() -> int:
         read_jsonl(args.candidate_override, "question_id")
         if args.candidate_override is not None else {}
     )
-    adjacency = load_adjacency(args.relation_store, args.graph_mode, args.semantic_k)
+    adjacency = load_candidate_graph(args.relation_store, args.graph_mode, args.semantic_k,
+                                     observation_contract=observations.contract if observations else None)
     run_contract = {
         **evidence_contract,
         **({"observation_questions_sha256": questions_digest} if observations else {}),
@@ -273,7 +279,8 @@ def main() -> int:
     def score(qid: str) -> dict[str, Any]:
         started = time.perf_counter()
         model = get_model()
-        visible = visible_ids(raw_questions[qid], memories.values())
+        visible = visible_ids(raw_questions[qid], source_memories.values())
+        query_graph = {}
         if candidate_override:
             if qid not in candidate_override:
                 raise KeyError(f"candidate override missing question_id={qid}")
@@ -289,13 +296,14 @@ def main() -> int:
             if unknown:
                 raise KeyError(f"candidate override contains unknown memories: {unknown[:3]}")
         else:
-            candidates = candidate_pool(
+            query_graph = build_candidate_graph(
                 priors[qid], adjacency, source_top_l=args.source_top_l,
                 candidate_limit=args.candidate_limit, visible_memory_ids=visible,
             )
-        if not set(candidates) <= visible:
+            candidates = query_graph["candidate_ids"]
+        if not set(candidates) <= (units.visible(raw_questions[qid]) if units else visible):
             raise ValueError("verifier candidates are outside the question memory scope")
-        raw_scores = source_score_map(priors[qid])
+        raw_scores = source_score_map(priors[qid], unit_level=units is not None)
         question = resolved[qid]
         query_text = question_text(question)
         captions = caption_question_images(
@@ -312,6 +320,8 @@ def main() -> int:
             ),
             "candidates": [{
                 "id": aliases[memory_id],
+                **({"unit_id": memory_id, "source_memory_id": units.owners[memory_id]}
+                   if units else {}),
                 "modalities": modality_tags(memories[memory_id]),
                 "date": str(memories[memory_id].get("timestamp", ""))[:10],
                 "location": memory_location(memories[memory_id])[:120],
@@ -369,6 +379,7 @@ def main() -> int:
                 scores[memory_id] = max(scores.get(memory_id, 0.0), value)
         return {
             **evidence_contract,
+            **({"unit_graph": query_graph["unit_graph"]} if "unit_graph" in query_graph else {}),
             **({"observation_questions_sha256": run_contract["observation_questions_sha256"]} if observations else {}),
             **({"observation_ids": {mid: snippet_observation_ids(memories[mid], args.snippet_chars)
                                     for mid in candidates}} if observations else {}),

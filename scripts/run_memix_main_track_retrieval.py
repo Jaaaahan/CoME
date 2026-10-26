@@ -234,6 +234,7 @@ def main() -> int:
                         cached["visible_memory_ids"] = sorted(scope)
                     if observations:
                         cached["observation_hits"] = detail.get("observation_hits", {})
+                        cached["unit_hits"] = detail["unit_hits"]
                     append_jsonl(prior_handle, cached)
                     priors[question_id] = cached
                 details.append({

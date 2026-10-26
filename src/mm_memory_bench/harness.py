@@ -202,6 +202,13 @@ def _resolved_memory(
         value["metadata"] = public_metadata
     if observations is not None:
         value = observations.attach(value)
+        # References use original content positions. A derived view may remove
+        # images or shift those positions, so keep resolved source images in a
+        # separate, validated map for observation encoding only.
+        image_positions = {ref["part_index"]
+                           for obs in value["metadata"]["come"]["observations"]
+                           for ref in obs["source_refs"] if ref["kind"] == "image"}
+        value["observation_source_images"] = {str(i): raw_content[i] for i in image_positions}
     return value
 
 

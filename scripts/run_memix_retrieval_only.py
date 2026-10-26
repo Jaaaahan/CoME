@@ -375,12 +375,16 @@ def main() -> int:
                 detail = method._source_detail(resolved)
                 cached = {
                     "question_id": question_id,
+                    "context_id": str(raw["context_id"]),
                     "retrieval_ids": detail["retrieval_ids"],
                     "retrieval_scores": detail["retrieval_scores"],
                     "latency_seconds": time.perf_counter() - query_started,
                     "legacy_empty_choices": args.legacy_empty_choices,
                     **source_prior_contract,
                 }
+                if "unit_hits" in detail:
+                    cached["unit_hits"] = detail["unit_hits"]
+                    cached["observation_hits"] = detail.get("observation_hits", {})
                 append_jsonl(prior_handle, cached)
                 cached_priors[question_id] = cached
             source_details.append({
