@@ -190,7 +190,7 @@ class ObservationStore:
     def put(self, observation: Observation) -> bool:
         previous = self.latest.get(observation.id)
         if previous == observation:
-            return False
+            return False 
         self._accept(observation)
         try:
             if self.path:

@@ -76,6 +76,11 @@ class ObservationPreprocessor:
         if failed_images:
             raise ValueError(f"observation extraction incomplete for {len(failed_images)} images; "
                              f"first={failed_images[0]}; see ingestion.json image_outcomes")
-        return [{"context_id": str(m.get("context_id", "")), "memory_id": str(m["memory_id"]),
-                 "come": export_field(m, self.catalog, self.store.latest.values())}
-                for m in self.catalog.memories.values()]
+        return [
+            {
+                "context_id": str(m.get("context_id", "")), 
+                "memory_id": str(m["memory_id"]),
+                "come": export_field(m, self.catalog, self.store.latest.values())
+            }
+                for m in self.catalog.memories.values()
+        ]

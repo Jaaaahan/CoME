@@ -67,7 +67,7 @@ def main() -> int:
             for memory_index, memory in enumerate(batch.memories, 1):
                 method.ingest(
                     _resolved_memory(reader, memory, memory_view=args.memory_view, observations=observations)
-                )
+                ) #将当前对话/文档/图片等 memory 处理成符合安全访问规则的标准格式，并加入 Memix 的向量记忆库，以便后续检索和回答问题。
                 if args.progress_interval > 0 and memory_index % args.progress_interval == 0:
                     print(json.dumps({
                         "event": "ingest_progress", "context_id": batch.context["context_id"],

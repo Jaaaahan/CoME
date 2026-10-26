@@ -40,6 +40,42 @@ def raw_memories(reader) -> list[dict]:
 
 
 def export_field(memory: dict, catalog, observations: Iterable[Observation]) -> dict:
+    """
+    return sth just like this:
+    {
+  "schema_version": 1,
+  "producer_protocol": "come-observation-field-1",
+  "source_digest": "<整条记忆的来源摘要>",
+  "observations": [
+    {
+      "id": "obs:7e3a91b4c8d205f6a1b930ce",
+      "memory_id": "memory-1",
+      "asset_id": "image-1",
+      "regions": [[120, 80, 400, 500]],
+      "description": "图片中有一个红色杯子",
+      "source_refs": [
+        {
+          "kind": "image",
+          "memory_id": "memory-1",
+          "part_index": 1,
+          "asset_id": "image-1",
+          "source_version": "<原图文件的 SHA-256>"
+        }
+      ],
+      "version": 1,
+      "fact": {
+        "subject": "image-1:cup1",
+        "predicate": "color",
+        "value": "red",
+        "basis": "visual"
+      },
+      "asset_version": "<原图文件的 SHA-256>",
+      "coordinate_system": "oriented_pixel_xyxy",
+      "image_size": [1200, 800]
+    }
+  ]
+}
+    """
     exported = []
     seen = set()
     for obs in sorted(observations, key=lambda o: o.id):

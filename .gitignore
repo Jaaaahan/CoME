@@ -46,3 +46,6 @@ Memix-core-share-*.tar.gz
 /cluster
 
 /result_h100
+/assets
+/docs
+/baseline_result
