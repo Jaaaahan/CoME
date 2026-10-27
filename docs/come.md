@@ -109,20 +109,23 @@ node 阶段将 unit ID 直接传给原来的 `candidate_pool()`，不另写扩�
 3. 按原有边相似度、种子排名和节点 ID 排序，对相同 unit ID 去重并补充至 `candidate_limit`，默认 48 个 unit。可见范围过滤、图模式和一跳限制沿用原逻辑；过滤后不重新计算邻居，不增加目标 memory 配额。
 4. 候选 unit 直接传给节点验证、ECV、森林选择和剪枝，再将选中的 unit 交给 Reader。同一 memory 的多个观察、以及完整 memory 本身均保留各自的 ID、分数和内容。node 缓存记录 `seed_unit_ids`、`candidate_unit_ids` 和图关系；父 memory 只出现在溯源元数据时，不自动成为候选或新的扩展根。
 
-因此，24/48 和最终选择的 k 都按 unit 计数。节点验证、ECV、森林和 Reader 的评分公式、选择算法保持不变。选择与剪枝输出的 `retrieved_unit_ids` 是后续唯一的证据输入，Reader 将它保存在预测的 `metadata.retrieved_unit_ids`。另存的 `retrieved_memory_ids` 只用于按原 benchmark 标注统计来源级召回，不参与下游选择或 agent 输入。关闭 observations 时继续使用原有 memory 图。
+因此，24/48 和最终选择的 k 都按 unit 计数。增强配置 `configs/release/graphmemix.json` 的 `reader_k` 默认为 **20**，即 24 个种子 → 最多 48 个候选 → 最多 20 个最终 unit；冻结的 legacy 配置仍为 10。节点验证、ECV、森林和 Reader 的评分公式保持不变。精确剪枝固定保留独立净收益为正的节点，只枚举其余节点；没有有效边时直接求独立节点的最优非空集合，保持原目标和精确性，避免 20 个节点都做全子集枚举。剪枝报告按实际输入 Top-K 计算召回，不再固定截断为 10。选择与剪枝输出的 `retrieved_unit_ids` 是后续唯一的证据输入，Reader 将它保存在预测的 `metadata.retrieved_unit_ids`。另存的 `retrieved_memory_ids` 只用于按原 benchmark 标注统计来源级召回，不参与下游选择或 agent 输入。关闭 observations 时继续使用原有 memory 图。
 
 建库、priors、关系构建、节点验证、ECV、选择、剪枝和 Reader 的脚本都接受 `--observations`。节点验证与 ECV 独立加载 sidecar；Reader 校验 checkpoint 的观察契约后重新挂载同一快照，支持正常多模态、text-only 和 action-aware 三种模式。
 
 ## 展示预算与缓存
 
-- verifier/ECV 保持每条证据总计 420 字符的默认预算。观察最多占 `min(300, 总预算×3/4)`，先保留观察所需空间，再渲染原有证据。
-- observation unit 仅展示自己的观察及必要来源原文，不附带父 memory 的其他文本或兄弟观察；完整 memory unit 保持原有内容，不自动拼入全部观察。每个观察与其必要原文作为整体保留或省略，不截断后确认身份。
-- Reader 对每个 observation unit 使用原有 1200 字符观察预算，并发送它的来源区域图像；text-only 模式只发送文本，action-aware 模式继续按原有 text/low/high 动作控制图像输入。原有上下文窗口、输出预算、OCR 预算和 token 检查保持不变。
+- verifier/ECV 的 `snippet` 仍为默认 420 字符，观察最多占 `min(300, snippet预算×3/4)`。每个 observation 另外携带 `source_context`，来源上下文不挤占观察摘要预算；ECV 的候选和 anchor 都展示同一结构。
+- `source_context` 从快照校验过的原始记忆生成，包含来源记录时间 `recorded_timestamp`、session/source/round 标识（有值时）、说话者及最多 600 字符的原始文本。超长原文明确标记 `original_text_truncated=true`。记录时间不自动等同于事件时间，原文片段也不表示完整身份依据；带来源引用的观察事实仍遵守原有完整保留或省略规则。
+- Reader 使用同一份来源上下文、原有 1200 字符观察预算及来源区域图像。上下文独立于该观察预算，三种 Reader 模式都展示它。上下文从原始 bundle 恢复，避免把 checkpoint 的 derived caption 当作原文；不自动加入兄弟观察，也不把 observation 合并回父 memory。
+- text-only 模式只发送文本，action-aware 模式继续按原有 text/low/high 动作控制图像输入。总上下文窗口仍为 32768 tokens，输出预算、OCR 预算和 token 检查保持不变。
 - 展示文本明确标记为模型观察，不是真值。节点/ECV 的 `observation_ids` 和 Reader 的 `metadata.observation_ids` 按 unit ID 记录实际展示的观察；Reader 的 `query_added_observations` 为 0。
 
 checkpoint 绑定观察契约、编码协议、embedding 身份和 memory view。当前编码协议为 `graphmemix-observation-region-description-2`，图协议为 `graphmemix-offline-unit-graph-2`。priors 绑定 state/index 摘要；unit 图校验观察契约及 prior 对应的 checkpoint 索引，防止混用不同向量空间。node/ECV 绑定关系文件摘要、观察快照和渲染协议，其中 `evidence_identity=graphmemix-unit-evidence-1` 区分独立 unit 与旧的父 memory 合并输入。选择、剪枝记录输入摘要，Reader 绑定 checkpoint、选择记录、问题文件和渲染协议；judge 已按预测行摘要判断缓存。
 
 不兼容缓存会明确拒绝续跑，请使用新产物路径重建受影响阶段。更换 embedding 不要求重做观察；修改源文件或提取设置则必须先生成新的观察快照。查询阶段不会调用提取或 grounding，不写观察，也不更新索引。
+
+来源上下文变更使用 `graphmemix-observation-evidence-2` 渲染协议，并把上下文版本、原文预算和截断规则写入契约。升级后可复用原观察、embedding checkpoint、priors 和离线图；使用新的 `--run-root`，从 `--from-stage node` 开始重新生成节点分数、ECV、选择、剪枝、Reader 和判分。不要复用缺少来源上下文的旧评分或旧答案。
 
 从纯文本观察版本迁移时，可以复用原有 observations JSONL 和 manifest，但必须重建 checkpoint、priors、relations 及后续查询产物。如果已按上一版生成图文 checkpoint 和包含 `unit_hits` 的 priors，这两者可以复用，只需重建 relations 及之后的产物。之前“查询时计算邻居”的 `unit_index` 关系文件会被拒绝；新版关系文件不依赖额外的 `.units-*.faiss` 文件。
 

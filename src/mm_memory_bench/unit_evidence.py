@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Any, Mapping, Sequence
 
 from .memory_scope import visible_ids
+from .observation_context import render_source_context
 from .retrieval_units import unit_identity
 
 
@@ -32,13 +33,14 @@ class UnitEvidenceCatalog:
                 if uid in self.records:
                     raise ValueError("duplicate observation evidence unit")
                 self.owners[uid] = mid
-                # A selected observation must not inherit unrelated parent text,
-                # captions, or sibling observations as its own evidence.
+                # Preserve bounded raw source context separately from the
+                # observation. Do not inherit captions or sibling observations.
                 metadata = {key: value for key, value in memory.get("metadata", {}).items()
                             if key not in {"derived", "come"}}
                 metadata["come"] = _field(memory, [observation])
                 self.records[uid] = {**memory, "unit_id": uid, "parent_memory_id": mid,
                     "observation_id": observation["id"], "kind": "observation",
+                    "source_context": deepcopy(memory["observation_source_context"]),
                     "content": [{"type": "image", "asset_id": observation["asset_id"]}], "metadata": metadata}
 
     def visible(self, question: Mapping[str, Any]) -> set[str]:
@@ -93,8 +95,12 @@ def reader_unit_records(records: Sequence[Mapping[str, Any]], embedding_units: S
             path = public_asset_paths.get(obs["asset_id"], view.get("image"))
             if not path or not view.get("image_region"):
                 raise ValueError("observation evidence lacks its source image region")
+            if "observation_source_context" not in record:
+                raise ValueError("observation evidence lacks validated source context; attach the current snapshot")
+            context = deepcopy(record["observation_source_context"])
             result[uid] = {**record, "item_id": uid, "unit_id": uid, "parent_memory_id": mid,
-                "observation_id": obs["id"], "modality": "image", "text": "",
+                "observation_id": obs["id"], "modality": "image", "text": render_source_context(context),
+                "source_context": context,
                 "image_path": str(path), "video_path": None,
                 "metadata": {**record.get("metadata", {}), "come": _field(record, [obs])},
                 "content": [{"type": "image", "path": str(path), "asset_id": obs["asset_id"],

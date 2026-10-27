@@ -322,6 +322,8 @@ def main() -> int:
                 "id": aliases[memory_id],
                 **({"unit_id": memory_id, "source_memory_id": units.owners[memory_id]}
                    if units else {}),
+                **({"source_context": memories[memory_id]["source_context"]}
+                   if "source_context" in memories[memory_id] else {}),
                 "modalities": modality_tags(memories[memory_id]),
                 "date": str(memories[memory_id].get("timestamp", ""))[:10],
                 "location": memory_location(memories[memory_id])[:120],

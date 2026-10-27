@@ -10,6 +10,7 @@ import tempfile
 from typing import Any, Iterable, Mapping
 
 from ..core import iter_jsonl
+from ..observation_context import source_context
 from .store import atomic_json, file_digest
 from .types import (Fact, Observation, OBSERVATION_SCHEMA_VERSION,
                     OBSERVATION_PROTOCOL, OBSERVATION_ENCODING_PROTOCOL, digest)
@@ -205,6 +206,7 @@ class ObservationSnapshot:
             raise ValueError("observation snapshot digest mismatch")
         self._fields = {}
         sources = {(str(m.get("context_id", "")), str(m["memory_id"])): m for m in memories}
+        self._source_contexts = {key: source_context(memory) for key, memory in sources.items()}
         for row in iter_jsonl(path):
             if set(row) != {"context_id", "memory_id", "come"}:
                 raise ValueError("invalid observation sidecar row")
@@ -232,7 +234,8 @@ class ObservationSnapshot:
         key = (str(memory.get("context_id", "")), str(memory.get("memory_id", memory.get("item_id", ""))))
         if key not in self._fields:
             raise ValueError(f"observation snapshot missing memory {key}")
-        return {**memory, "metadata": {**memory.get("metadata", {}), "come": deepcopy(self._fields[key])}}
+        return {**memory, "metadata": {**memory.get("metadata", {}), "come": deepcopy(self._fields[key])},
+                "observation_source_context": deepcopy(self._source_contexts[key])}
 
     def require_contract(self, actual: Mapping[str, Any] | None) -> None:
         if actual != self.contract:

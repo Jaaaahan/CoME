@@ -90,7 +90,9 @@ def main():
               'questions': expected, 'backend': 'standalone', 'memory_view': 'derived',
               'offline_files_unchanged': len(hashes), 'observations': sum(len(r['come']['observations']) for r in observations),
               'extraction_usage': dict(usage), 'predictions_sha256': file_digest(prediction_path),
-              'retrieval': metrics_for(questions.values(), predictions, 10, memory_sessions(bundle / 'memories.jsonl')),
+              'retrieval': metrics_for(questions.values(), predictions,
+                  max(p['metadata']['retrieval_metadata']['original_k'] for p in predictions.values()),
+                  memory_sessions(bundle / 'memories.jsonl')),
               'native_metrics': {key: {'value': statistics.mean(values), 'questions': len(values)} for key, values in scores.items()},
               'judge_model': QwenJudge.model, 'official_gpt5_mini_judge_run': False}
     if args.dataset == 'h2hmem':

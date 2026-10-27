@@ -55,7 +55,7 @@ def test_benchmark_config_freezes_four_datasets_and_two_backbones() -> None:
     }
     assert suite["source_top_l"] == 24
     assert suite["candidate_limit"] == 48
-    assert suite["reader_k"] == 10
+    assert suite["reader_k"] == 20
     assert {value["reasoning_effort"] for value in suite["backbones"].values()} == {"none"}
     calibration = json.loads((ROOT / suite["calibration_file"]).read_text(encoding="utf-8"))
     assert calibration["coefficients"] == {

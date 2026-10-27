@@ -57,7 +57,13 @@ def exact_subset(
     root_cost: float,
     node_cost: float,
 ) -> tuple[list[str], dict[str, Any]]:
-    """Enumerate all nonempty subsets; Kruskal gives the exact forest per subset."""
+    """Exactly optimize the frozen set, enumerating only optional nodes.
+
+    A node with positive standalone net value must occur in an optimum: adding
+    it always improves utility, even as an isolated root. Forest edge benefits
+    are nonnegative, so adding a node cannot reduce the best edge contribution.
+    This keeps the 20-unit path cheap without changing the objective.
+    """
     ids = list(dict.fromkeys(map(str, ordered_ids)))
     n = len(ids)
     if n > 20:
@@ -73,10 +79,25 @@ def exact_subset(
             weighted_edges.append((benefit, index[left], index[right], role))
     weighted_edges.sort(key=lambda value: (-value[0], value[1], value[2], value[3]))
 
+    net_values = [float(prizes[mid]) - node_cost - root_cost for mid in ids]
+    mandatory = sum(1 << i for i, value in enumerate(net_values) if value > 0)
+    if not weighted_edges:
+        # With no useful edges, take every positive node; if there are none,
+        # the required nonempty optimum is the earliest best singleton.
+        masks = [mandatory or (1 << max(range(n), key=lambda i: net_values[i]))] if n else []
+    else:
+        optional = [i for i in range(n) if not mandatory >> i & 1]
+        masks = (mandatory | sum(1 << i for bit, i in enumerate(optional) if subset >> bit & 1)
+                 for subset in range(1 << len(optional)))
+
     best_value = -math.inf
     best_mask = 0
     best_edges: list[tuple[int, int, str]] = []
-    for mask in range(1, 1 << n):
+    evaluated_subsets = 0
+    for mask in masks:
+        if not mask:
+            continue
+        evaluated_subsets += 1
         parent = list(range(n))
 
         def find(value: int) -> int:
@@ -122,6 +143,7 @@ def exact_subset(
         "exact_scope": "frozen_input_topk",
         "globally_exact_over_candidate_pool": False,
         "search_space": (1 << n) - 1,
+        "evaluated_subsets": evaluated_subsets,
     }
 
 
@@ -191,6 +213,8 @@ def main() -> int:
     units = UnitEvidenceCatalog({mid: snapshot.attach(memory) for mid, memory in
         read_jsonl(args.bundle / "memories.jsonl", "memory_id").items()}) if snapshot else None
     qids = sorted(set(priors) & set(retrieval) & set(questions))
+    retrieval_k = max((len(selected_evidence_ids(retrieval[qid], unit_level=units is not None))
+                       for qid in qids), default=0)
     node_costs = args.node_cost if args.node_cost is not None else [0.0]
     root_costs = args.root_cost if args.root_cost is not None else [0.2]
 
@@ -244,7 +268,7 @@ def main() -> int:
         with path.open("w", encoding="utf-8") as handle:
             for qid in qids:
                 handle.write(json.dumps(output[qid], ensure_ascii=False) + "\n")
-        metric = metrics_for((questions[qid] for qid in qids), output, 10, sessions)
+        metric = metrics_for((questions[qid] for qid in qids), output, retrieval_k, sessions)
         metric.update({
             "mean_selected": float(np.mean(lengths)),
             "median_selected": float(np.median(lengths)),

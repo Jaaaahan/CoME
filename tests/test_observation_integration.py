@@ -103,6 +103,7 @@ def bundle(tmp_path):
     write_rows(root / 'contexts.jsonl', [{'context_id': 'ctx'}])
     write_rows(root / 'memories.jsonl', [
         {'context_id': 'ctx', 'memory_id': 'm0', 'session_id': 's', 'sequence': 0,
+         'timestamp': '2025-04-28',
          'source_id': 'source0', 'content': [{'type': 'image', 'asset_id': 'a1'},
          {'type': 'text', 'text': 'This is my cup.'}],
          'metadata': {'derived': {'caption': 'A cup on a table.'}, 'answer': 'PRIVATE'}},
@@ -353,6 +354,29 @@ def test_unit_evidence_preserves_same_parent_identity_scope_and_scores(bundle, t
     assert missing_atomic_floor(prior) == pytest.approx(.89)
 
 
+def test_source_context_uses_validated_raw_text_and_separate_bounded_budget(bundle, tmp_path):
+    from mm_memory_bench.observation_context import SOURCE_CONTEXT_TEXT_CHARS
+    data = rows(bundle / 'memories.jsonl')
+    original = 'This is the final ring/card screen. ' + 'Additional source detail. ' * 80
+    data[0]['content'][1]['text'] = original
+    write_rows(bundle / 'memories.jsonl', data)
+    reader, _, snapshot = make_snapshot(bundle, tmp_path)
+    # Derived views contain extra caption text. Context must be reconstructed
+    # from the validated raw sources rather than copied from that view.
+    derived = _resolved_memory(reader, data[0], memory_view='derived', observations=snapshot)
+    catalog = UnitEvidenceCatalog({'m0': derived})
+    unit = catalog.records[unit_identity('m0', 'o000')]
+    context = unit['source_context']
+    assert context['original_text'] == original[:SOURCE_CONTEXT_TEXT_CHARS]
+    assert context['original_text_truncated'] is True
+    assert context['recorded_timestamp'] == '2025-04-28'
+    assert 'A cup on a table.' not in json.dumps(context) and 'PRIVATE' not in json.dumps(context)
+    assert 'vermilion' in memory_snippet(unit, include_observations=True)
+    assert len(memory_snippet(unit, include_observations=True)) <= 420
+    context['original_text'] = 'mutated'
+    assert snapshot.attach(data[0])['observation_source_context']['original_text'] != 'mutated'
+
+
 @pytest.mark.parametrize('mode', ['normal', 'text', 'actions'])
 def test_reader_receives_only_selected_units_and_their_crops(bundle, tmp_path, mode):
     reader, _, snapshot = make_snapshot(bundle, tmp_path, count=3)
@@ -389,7 +413,9 @@ def test_reader_receives_only_selected_units_and_their_crops(bundle, tmp_path, m
     text = '\n'.join(p['text'] for p in blocks if p['type'] == 'text')
     assert text.index(f'unit_id={ids[0]}') < text.index(f'unit_id={ids[1]}')
     assert text.count('Evidence ') == 2 and 'A vermilion cup 1.' in text and 'A vermilion cup 0.' in text
-    assert 'o002' not in text and 'This is my cup.' not in text and 'A cup on a table.' not in text
+    assert 'This is my cup.' in text
+    assert 'recorded_timestamp' in text and '2025-04-28' in text and 'session_id' in text
+    assert 'o002' not in text and 'A cup on a table.' not in text and 'PRIVATE' not in text
     sizes = []
     for part in blocks:
         if part['type'] == 'image_url':
@@ -403,9 +429,10 @@ def test_reader_receives_only_selected_units_and_their_crops(bundle, tmp_path, m
     assert 'o000' not in text and 'o002' not in text  # No auto-added sibling observations.
 
 
-@pytest.mark.parametrize('observation_only', [False, True])
-def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bundle, tmp_path, monkeypatch, observation_only):
-    reader, sidecar, snapshot = make_snapshot(bundle, tmp_path, count=3 if observation_only else 1)
+@pytest.mark.parametrize('observation_only,final_k', [(False, 3), (True, 2), (False, 20)])
+def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bundle, tmp_path, monkeypatch, observation_only, final_k):
+    observation_count = 3 if observation_only else 24 if final_k == 20 else 1
+    reader, sidecar, snapshot = make_snapshot(bundle, tmp_path, count=observation_count)
     build = importlib.import_module('scripts.build_memix_checkpoints')
     priors = importlib.import_module('scripts.run_memix_main_track_retrieval')
     relations = importlib.import_module('scripts.build_graphmemix_relation_store')
@@ -445,12 +472,13 @@ def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bund
     monkeypatch.setattr(relations, 'mutual_neighbors', track_neighbors)
     assert invoke(monkeypatch, relations, *common, '--checkpoint-root', checkpoint, '--output', graph) == 0
     graphs = [row for row in rows(graph) if row.get('record_type') == 'unit_graph']
-    assert searched_nodes == [15 if observation_only else 13]
+    assert searched_nodes == [12 + observation_count]
     assert len(graphs) == 1 and len(graphs[0]['units']) == searched_nodes[0]
     assert any(edge.get('semantic_similarity') is not None for edge in graphs[0]['edges'])
     before[graph] = file_digest(graph)
     node_args = [*common, '--source-priors', prior_path, '--relation-store', graph, '--graph-mode', 'full',
-                 '--source-top-l', 2, '--candidate-limit', 2 if observation_only else 4,
+                 '--source-top-l', 24 if final_k == 20 else 2,
+                 '--candidate-limit', 48 if final_k == 20 else 2 if observation_only else 4,
                  '--output', nodes, '--all-questions', '--concurrency', 1]
     assert invoke(monkeypatch, node, *node_args) == 0
     assert rows(nodes)[0]['observations'] == snapshot.contract
@@ -460,14 +488,25 @@ def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bund
         assert rows(nodes)[0]['candidate_ids'] == [unit_identity('m0', 'o000'), unit_identity('m0', 'o001')]
         assert 'o002' not in json.dumps(Model.messages[-1])
     assert 'o000' in json.dumps(Model.messages[-1]) and 'vermilion' in json.dumps(Model.messages[-1])
+    node_payload = json.loads(Model.messages[-1][1]['content'])
+    unit_context = next(c['source_context'] for c in node_payload['candidates']
+                        if c.get('unit_id') == unit_identity('m0', 'o000'))
+    assert unit_context['recorded_timestamp'] == '2025-04-28'
+    assert unit_context['session_id'] == 's'
+    assert unit_context['original_text'] == 'This is my cup.'
     assert invoke(monkeypatch, ecv, *common, '--candidate-cache', nodes, '--relation-store', graph,
                   '--output', edges, '--anchor-mode', 'atomic', '--anchor-count', 2, '--edge-only', '--concurrency', 1) == 0
     assert rows(edges)[0]['observations'] == snapshot.contract
     assert 'o000' in json.dumps(Model.messages[-1])
+    if not observation_only:  # Observation-only candidates have no explicit edges to verify.
+        edge_payload = json.loads(Model.messages[-1][1]['content'])
+        if final_k == 3:
+            assert any(c.get('source_context') == unit_context for c in edge_payload['candidates'])
+        assert any(c.get('source_context') == unit_context for c in edge_payload['anchor_evidence'])
     calibration = Path(__file__).resolve().parents[1] / 'configs/release/calibration/shared_dev.json'
     assert invoke(monkeypatch, select, *common, '--ecv-scores', edges, '--original-verifier', nodes,
         '--source-priors', prior_path, '--relation-store', graph, '--calibration', calibration,
-        '--output-dir', tmp_path / 'selection', '--edge-power', 1, '--k', 2 if observation_only else 3) == 0
+        '--output-dir', tmp_path / 'selection', '--edge-power', 1, '--k', final_k) == 0
     fixed = tmp_path / 'selection/original_ecv_edge_p1.jsonl'
     assert invoke(monkeypatch, prune, *common, '--scores', nodes, '--ecv-scores', edges,
         '--source-priors', prior_path, '--retrieval', fixed, '--calibration', calibration,
@@ -483,6 +522,9 @@ def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bund
     assert result['metadata']['observation_ids'][unit_identity('m0', 'o000')] == ['o000']
     assert result['metadata']['retrieved_unit_ids'] == rows(final)[0]['retrieved_unit_ids']
     assert set(rows(final)[0]['retrieved_unit_ids']) <= set(rows(fixed)[0]['retrieved_unit_ids'])
+    if final_k == 20:
+        assert len(result['metadata']['retrieved_unit_ids']) == 20
+        assert 'R@20' in json.loads((tmp_path / 'pruning/summary.json').read_text())['variants']['root0.12_node0']
     if observation_only:
         expected = [unit_identity('m0', 'o000'), unit_identity('m0', 'o001')]
         assert rows(nodes)[0]['candidate_ids'] == rows(edges)[0]['candidate_ids'] == expected
@@ -490,7 +532,8 @@ def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bund
         assert result['metadata']['retrieved_unit_ids'] == expected
         assert result['retrieved_memory_ids'] == ['m0']  # Source-level benchmark reporting only.
         assert 'o001' in json.dumps(Model.messages[-1]) and 'o002' not in json.dumps(Model.messages[-1])
-        assert 'This is my cup.' not in json.dumps(Model.messages[-1])
+        assert 'This is my cup.' in json.dumps(Model.messages[-1])
+        assert '2025-04-28' in json.dumps(Model.messages[-1])
     assert 'o000' in json.dumps(Model.messages[-1]) and 'PRIVATE' not in json.dumps(Model.messages)
     calls = len(Model.messages)
     assert invoke(monkeypatch, answer, *answer_args) == 0
@@ -598,10 +641,12 @@ def test_release_stages_resume_and_disabled_config_match_legacy(tmp_path, monkey
     root = Path(__file__).resolve().parents[1]
     enhanced = json.loads((root / 'configs/release/graphmemix.json').read_text())
     legacy = json.loads((root / 'configs/release/graphmemix_legacy.json').read_text())
-    # The frozen legacy Judge uses 1.2 while the current Judge uses 1.3;
-    # method/retrieval settings still match when observations are disabled.
-    assert {k: v for k, v in enhanced['benchmark_suite'].items() if k != 'judge'} == {
-        k: v for k, v in legacy['benchmark_suite'].items() if k != 'judge'}
+    # Independent units now have a larger final evidence budget than the
+    # frozen memory-level baseline. Other retrieval settings remain comparable.
+    assert enhanced['benchmark_suite']['reader_k'] == 20
+    assert legacy['benchmark_suite']['reader_k'] == 10
+    assert {k: v for k, v in enhanced['benchmark_suite'].items() if k not in {'judge', 'reader_k'}} == {
+        k: v for k, v in legacy['benchmark_suite'].items() if k not in {'judge', 'reader_k'}}
     commands = []
     monkeypatch.setattr(release.Runner, 'run', lambda self, command, **kwargs: commands.append(command))
     common = ['benchmark', '--dataset', 'atm', '--backbone', 'qwen3vl8b', '--to-stage', 'reader', '--dry-run']
@@ -612,6 +657,8 @@ def test_release_stages_resume_and_disabled_config_match_legacy(tmp_path, monkey
     assert all('--observations' in command for command in commands[1:])
     assert commands[-1][1].endswith('run_memix_answers_from_retrieval.py')
     assert '--memory-view' in commands[1] and 'derived' in commands[1]
+    selection_command = next(c for c in commands if c[1].endswith('evaluate_graphmemix_ecv.py'))
+    assert selection_command[selection_command.index('--k') + 1] == '20'
     extraction_command = deepcopy(commands[0])
     commands.clear()
     assert invoke(monkeypatch, release, 'benchmark', '--dataset', 'atm', '--backbone', 'gemma4_12b',
@@ -622,6 +669,7 @@ def test_release_stages_resume_and_disabled_config_match_legacy(tmp_path, monkey
     baseline_commands = deepcopy(commands)
     commands.clear()
     enhanced['observations']['enabled'] = False
+    enhanced['benchmark_suite']['reader_k'] = legacy['benchmark_suite']['reader_k']
     disabled = tmp_path / 'disabled.json'; disabled.write_text(json.dumps(enhanced))
     assert invoke(monkeypatch, release, '--config', disabled, *common) == 0
     assert commands == baseline_commands

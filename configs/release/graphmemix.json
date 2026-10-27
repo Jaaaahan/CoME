@@ -43,7 +43,7 @@
     "candidate_limit": 48,
     "semantic_k": 8,
     "anchor_count": 10,
-    "reader_k": 10,
+    "reader_k": 20,
     "edge_weight": 0.1,
     "proposal_root_cost": 0.2,
     "pruning_root_cost": 0.12,

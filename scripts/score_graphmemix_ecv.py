@@ -402,6 +402,8 @@ def main() -> int:
             candidates.append({
                 "id": aliases[mid],
                 **({"unit_id": mid, "source_memory_id": units.owners[mid]} if units else {}),
+                **({"source_context": memories[mid]["source_context"]}
+                   if "source_context" in memories[mid] else {}),
                 "is_atomic_anchor": mid in anchor_set,
                 "modalities": modality_tags(memories[mid]),
                 "date": str(memories[mid].get("timestamp", ""))[:10],
@@ -472,6 +474,8 @@ def main() -> int:
                 "anchor_evidence": [
                     {
                         "id": aliases[mid],
+                        **({"source_context": memories[mid]["source_context"]}
+                           if "source_context" in memories[mid] else {}),
                         "date": str(memories[mid].get("timestamp", ""))[:10],
                         "location": memory_location(memories[mid])[:120],
                         "snippet": memory_snippet(

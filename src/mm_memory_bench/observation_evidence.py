@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Mapping, Any
 
-RENDER_PROTOCOL = "graphmemix-observation-evidence-1"
+RENDER_PROTOCOL = "graphmemix-observation-evidence-2"
 MAX_OBSERVATIONS = 4
 SNIPPET_OBSERVATION_CHARS = 300
 READER_OBSERVATION_CHARS = 1200
@@ -45,8 +45,13 @@ def render_observations(memory: Mapping[str, Any], *, max_chars: int,
 
 def rendering_contract() -> dict:
     from .unit_evidence import UNIT_EVIDENCE_PROTOCOL
+    from .observation_context import SOURCE_CONTEXT_PROTOCOL, SOURCE_CONTEXT_TEXT_CHARS
     return {"protocol": RENDER_PROTOCOL, "max_observations": MAX_OBSERVATIONS,
             "evidence_identity": UNIT_EVIDENCE_PROTOCOL,
+            "source_context": {"protocol": SOURCE_CONTEXT_PROTOCOL,
+                               "original_text_chars": SOURCE_CONTEXT_TEXT_CHARS,
+                               "budget": "separate-from-observation-snippet",
+                               "truncation": "explicit-prefix-excerpt"},
             "snippet_observation_chars": SNIPPET_OBSERVATION_CHARS,
             "reader_observation_chars": READER_OBSERVATION_CHARS,
             "ordering": "observation_id", "text_support": "complete-or-omit"}
