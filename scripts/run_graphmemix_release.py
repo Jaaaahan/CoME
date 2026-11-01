@@ -99,8 +99,11 @@ def benchmark_commands(args: argparse.Namespace, config: dict[str, Any]) -> int:
     memix_repo = args.memix_repo or artifact_path(layout, "memix_repo", args.artifact_root, args.dataset)
     run_root = (args.run_root / "observations-v1" if enhanced else args.run_root) / args.backbone / args.dataset
     node = run_root / "node_scores.jsonl"
+    if args.disable_ecv:
+        run_root = run_root / "no-ecv"
     ecv = run_root / "ecv_scores.jsonl"
-    fixed = run_root / "selection/original_ecv_edge_p1.jsonl"
+    fixed = run_root / ("selection/original_fixed.jsonl" if args.disable_ecv
+                        else "selection/original_ecv_edge_p1.jsonl")
     pruned = run_root / "pruning/root0.12_node0.jsonl"
     predictions = run_root / "reader/predictions.jsonl"
     judgments = run_root / "judge/judgments.jsonl"
@@ -186,7 +189,7 @@ def benchmark_commands(args: argparse.Namespace, config: dict[str, Any]) -> int:
         if not args.dry_run:
             validate_jsonl(node, expected)
 
-    if enabled("ecv"):
+    if enabled("ecv") and not args.disable_ecv:
         runner.run([
             sys.executable, script("score_graphmemix_ecv.py"),
             *observation_args,
@@ -210,7 +213,8 @@ def benchmark_commands(args: argparse.Namespace, config: dict[str, Any]) -> int:
         runner.run([
             sys.executable, script("evaluate_graphmemix_ecv.py"),
             *observation_args,
-            "--bundle", str(bundle), "--ecv-scores", str(ecv),
+            "--bundle", str(bundle),
+            *(["--disable-ecv"] if args.disable_ecv else ["--ecv-scores", str(ecv)]),
             "--original-verifier", str(node), "--source-priors", str(priors),
             "--relation-store", str(relations), "--calibration", str(calibration),
             "--output-dir", str(run_root / "selection"),
@@ -225,7 +229,8 @@ def benchmark_commands(args: argparse.Namespace, config: dict[str, Any]) -> int:
         runner.run([
             sys.executable, script("evaluate_graphmemix_exact_pruning.py"),
             *observation_args,
-            "--bundle", str(bundle), "--scores", str(node), "--ecv-scores", str(ecv),
+            "--bundle", str(bundle), "--scores", str(node),
+            *(["--fixed-relation-store", str(relations)] if args.disable_ecv else ["--ecv-scores", str(ecv)]),
             "--source-priors", str(priors), "--retrieval", str(fixed),
             "--calibration", str(calibration), "--output-dir", str(run_root / "pruning"),
             "--edge-weight", str(suite["edge_weight"]),
@@ -342,6 +347,8 @@ def main() -> int:
     benchmark.add_argument("--judge-concurrency", type=int, default=2)
     benchmark.add_argument("--from-stage", choices=STAGES, default="observations")
     benchmark.add_argument("--to-stage", choices=STAGES, default="judge")
+    benchmark.add_argument("--disable-ecv", action="store_true",
+                           help="Skip ECV; use fixed offline edges for selection and pruning. Outputs go under no-ecv/.")
     benchmark.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     config = load_json(args.config)

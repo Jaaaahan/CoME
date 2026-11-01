@@ -512,6 +512,22 @@ def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bund
         '--source-priors', prior_path, '--retrieval', fixed, '--calibration', calibration,
         '--output-dir', tmp_path / 'pruning', '--root-cost', .12) == 0
     final = tmp_path / 'pruning/root0.12_node0.jsonl'
+    # The ablation must work without an ECV artifact and use fixed edges in both stages.
+    saved_edges = edges.read_bytes()
+    edges.unlink()
+    assert invoke(monkeypatch, select, *common, '--disable-ecv', '--original-verifier', nodes,
+        '--source-priors', prior_path, '--relation-store', graph, '--calibration', calibration,
+        '--output-dir', tmp_path / 'no-ecv-selection', '--k', final_k) == 0
+    fixed_no_ecv = tmp_path / 'no-ecv-selection/original_fixed.jsonl'
+    assert rows(fixed_no_ecv)[0]['metadata']['ecv_enabled'] is False
+    assert invoke(monkeypatch, prune, *common, '--scores', nodes, '--fixed-relation-store', graph,
+        '--source-priors', prior_path, '--retrieval', fixed_no_ecv, '--calibration', calibration,
+        '--output-dir', tmp_path / 'no-ecv-pruning', '--root-cost', .12) == 0
+    ablated = rows(tmp_path / 'no-ecv-pruning/root0.12_node0.jsonl')[0]
+    assert ablated['metadata']['ecv_enabled'] is False
+    assert ablated['metadata']['edge_source'] == 'offline_explicit'
+    assert set(ablated['retrieved_unit_ids']) <= set(rows(fixed_no_ecv)[0]['retrieved_unit_ids'])
+    edges.write_bytes(saved_edges)
     predictions = tmp_path / 'predictions.jsonl'
     answer_args = [*common, '--retrieval', final, '--checkpoint-root', checkpoint, '--backend', 'standalone',
                    '--output', predictions, '--reader-media-mode', 'text', '--allow-variable-retrieval',
@@ -660,6 +676,15 @@ def test_release_stages_resume_and_disabled_config_match_legacy(tmp_path, monkey
     selection_command = next(c for c in commands if c[1].endswith('evaluate_graphmemix_ecv.py'))
     assert selection_command[selection_command.index('--k') + 1] == '20'
     extraction_command = deepcopy(commands[0])
+    commands.clear()
+    assert invoke(monkeypatch, release, *common, '--disable-ecv') == 0
+    assert len(commands) == 8
+    assert not any(c[1].endswith('score_graphmemix_ecv.py') for c in commands)
+    selection = next(c for c in commands if c[1].endswith('evaluate_graphmemix_ecv.py'))
+    pruning = next(c for c in commands if c[1].endswith('evaluate_graphmemix_exact_pruning.py'))
+    assert '--disable-ecv' in selection and '--ecv-scores' not in selection
+    assert '--fixed-relation-store' in pruning and '--ecv-scores' not in pruning
+    assert '/no-ecv/' in commands[-1][commands[-1].index('--output') + 1]
     commands.clear()
     assert invoke(monkeypatch, release, 'benchmark', '--dataset', 'atm', '--backbone', 'gemma4_12b',
                   '--model', 'different-reader', '--to-stage', 'observations', '--dry-run') == 0

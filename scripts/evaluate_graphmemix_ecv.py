@@ -12,7 +12,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from evaluate_atm_retrieval import memory_sessions, metrics_for, read_jsonl
-from graphmemix_core import load_adjacency, load_candidate_graph, missing_atomic_floor
+from graphmemix_core import load_adjacency, load_candidate_graph, missing_atomic_floor, file_sha256
 from mm_memory_bench.unit_evidence import UnitEvidenceCatalog, UNIT_EVIDENCE_PROTOCOL
 from probe_graphmemix_pcsf import solve_forest_greedy
 
@@ -60,7 +60,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--observations", type=Path)
-    parser.add_argument("--ecv-scores", type=Path, required=True)
+    parser.add_argument("--ecv-scores", type=Path)
+    parser.add_argument("--disable-ecv", action="store_true", help="Use node scores and fixed offline explicit edges only.")
     parser.add_argument(
         "--question-reference", type=Path,
         help="Optional JSONL defining the intended question set when strict ECV rows may be missing.",
@@ -75,6 +76,8 @@ def main() -> int:
     parser.add_argument("--edge-power", type=float, action="append")
     parser.add_argument("--k", type=int, default=10)
     args = parser.parse_args()
+    if args.disable_ecv == bool(args.ecv_scores):
+        parser.error("choose exactly one of --disable-ecv and --ecv-scores")
     snapshot = None
     if args.observations:
         from mm_memory_bench.come.fields import ObservationSnapshot
@@ -85,9 +88,10 @@ def main() -> int:
     powers = args.edge_power or [1.0, 2.0]
     calibration = json.loads(args.calibration.read_text(encoding="utf-8"))["coefficients"]
     a, b, c = (float(calibration[key]) for key in ("a", "b", "c"))
-    ecv = read_jsonl(args.ecv_scores, "question_id")
-    reference = read_jsonl(args.question_reference, "question_id") if args.question_reference else ecv
     original = read_jsonl(args.original_verifier, "question_id")
+    ecv = {} if args.disable_ecv else read_jsonl(args.ecv_scores, "question_id")
+    reference = (read_jsonl(args.question_reference, "question_id") if args.question_reference
+                 else original if args.disable_ecv else ecv)
     priors = read_jsonl(args.source_priors, "question_id")
     questions = read_jsonl(args.bundle / "questions.jsonl", "question_id")
     sessions = memory_sessions(args.bundle / "memories.jsonl")
@@ -96,18 +100,23 @@ def main() -> int:
     fixed = (load_candidate_graph(args.relation_store, "explicit", 8,
                                   observation_contract=snapshot.contract).adjacency
              if snapshot else load_adjacency(args.relation_store, "explicit", 8))
+    fixed_digest = file_sha256(args.relation_store)
     variants = ["original_fixed", "ecv_fixed", "atomic_only_fixed"]
     variants += [f"original_ecv_edge_p{power:g}" for power in powers]
     variants += [f"ecv_ecv_edge_p{power:g}" for power in powers]
     variants += [f"atomic_only_ecv_edge_p{power:g}" for power in powers]
+    if args.disable_ecv:
+        variants = ["original_fixed"]
     predictions: dict[str, dict[str, dict[str, Any]]] = {label: {} for label in variants}
     diagnostics: dict[str, list[dict[str, Any]]] = {label: [] for label in variants}
     qids = sorted(set(reference) & set(original) & set(priors) & set(questions))
     fallback_questions = 0
     for done, qid in enumerate(qids, 1):
         orow = original[qid]
-        fallback = qid not in ecv
-        if fallback:
+        fallback = not args.disable_ecv and qid not in ecv
+        if args.disable_ecv:
+            erow = orow
+        elif fallback:
             fallback_questions += 1
             erow = {
                 "question_id": qid, "context_id": orow["context_id"],
@@ -145,17 +154,24 @@ def main() -> int:
                 (f"ecv_ecv_edge_p{power:g}", ecv_prizes, local),
                 (f"atomic_only_ecv_edge_p{power:g}", atomic_only_prizes, local),
             ))
+        if args.disable_ecv:
+            configurations = [("original_fixed", original_prizes, fixed)]
         for label, node_prizes, adjacency in configurations:
             selected, diagnostic = solve_forest_greedy(
                 ids, node_prizes, adjacency, k=args.k,
                 edge_weight=args.edge_weight, root_cost=args.root_cost,
             )
+            diagnostic["edge_source"] = "offline_explicit" if label.endswith("fixed") else "ecv"
+            diagnostic["ecv_enabled"] = not args.disable_ecv
+            if label.endswith("fixed"):
+                diagnostic["fixed_relation_sha256"] = fixed_digest
             if snapshot:
                 from mm_memory_bench.come.types import digest
                 diagnostic.update(observations=snapshot.contract, observation_questions_sha256=questions_digest,
                     evidence_identity=UNIT_EVIDENCE_PROTOCOL, observation_rendering=rendering_contract(),
                     selection_inputs_sha256=digest([orow, erow, priors[qid], calibration, label,
-                                                   args.k, args.edge_weight, args.root_cost]))
+                                                   args.k, args.edge_weight, args.root_cost,
+                                                   fixed_digest if label.endswith("fixed") else None]))
             predictions[label][qid] = {
                 "question_id": qid, "context_id": erow["context_id"],
                 **(units.selection(selected) if units else {"retrieved_memory_ids": selected}), "metadata": diagnostic,
@@ -167,6 +183,7 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
         "protocol": "graphmemix-ecv-controlled-1.0", "questions": len(qids),
+        "ecv_enabled": not args.disable_ecv,
         "ecv_format_fallback_questions": fallback_questions, "variants": {},
     }
     for label, values in predictions.items():

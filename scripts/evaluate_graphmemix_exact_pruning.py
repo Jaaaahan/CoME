@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from evaluate_atm_retrieval import memory_sessions, metrics_for, read_jsonl
-from graphmemix_core import missing_atomic_floor, source_score_map
+from graphmemix_core import missing_atomic_floor, source_score_map, load_candidate_graph
 from mm_memory_bench.unit_evidence import UnitEvidenceCatalog, UNIT_EVIDENCE_PROTOCOL, selected_evidence_ids
 
 
@@ -183,7 +183,9 @@ def main() -> int:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--observations", type=Path)
     parser.add_argument("--scores", type=Path, required=True)
-    parser.add_argument("--ecv-scores", type=Path, required=True)
+    edge_input = parser.add_mutually_exclusive_group(required=True)
+    edge_input.add_argument("--ecv-scores", type=Path)
+    edge_input.add_argument("--fixed-relation-store", type=Path, help="Prune using offline explicit edges without ECV.")
     parser.add_argument("--source-priors", type=Path, required=True)
     parser.add_argument("--retrieval", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
@@ -205,7 +207,15 @@ def main() -> int:
     calibration = json.loads(args.calibration.read_text(encoding="utf-8"))["coefficients"]
     a, b, c = (float(calibration[key]) for key in ("a", "b", "c"))
     scores = read_jsonl(args.scores, "question_id")
-    ecv = read_jsonl(args.ecv_scores, "question_id")
+    ecv = read_jsonl(args.ecv_scores, "question_id") if args.ecv_scores else {}
+    fixed = None
+    fixed_digest = None
+    if args.fixed_relation_store:
+        from graphmemix_core import file_sha256
+        graph = load_candidate_graph(args.fixed_relation_store, "explicit", 8,
+            observation_contract=snapshot.contract if snapshot else None)
+        fixed = graph.adjacency if snapshot else graph
+        fixed_digest = file_sha256(args.fixed_relation_store)
     priors = read_jsonl(args.source_priors, "question_id")
     retrieval = read_jsonl(args.retrieval, "question_id")
     questions = read_jsonl(args.bundle / "questions.jsonl", "question_id")
@@ -231,13 +241,18 @@ def main() -> int:
         output: dict[str, dict[str, Any]] = {}
         lengths: list[int] = []
         for qid in qids:
+            edge_row = ecv.get(qid, {}) if args.ecv_scores else scores[qid]
+            metadata = retrieval[qid].get("metadata", {})
+            if fixed is not None and (metadata.get("edge_source") != "offline_explicit" or
+                                      metadata.get("fixed_relation_sha256") != fixed_digest):
+                raise ValueError("fixed-edge pruning requires fixed-edge selection")
             if snapshot:
-                if any(row.get("observation_questions_sha256") != questions_digest for row in (scores[qid], ecv[qid], retrieval[qid].get("metadata", {}))):
+                if any(row.get("observation_questions_sha256") != questions_digest for row in (scores[qid], edge_row, retrieval[qid].get("metadata", {}))):
                     raise ValueError("selection inputs use stale questions")
                 from mm_memory_bench.observation_evidence import rendering_contract
-                if any(row.get("observation_rendering") != rendering_contract() for row in (scores[qid], ecv[qid], retrieval[qid].get("metadata", {}))):
+                if any(row.get("observation_rendering") != rendering_contract() for row in (scores[qid], edge_row, retrieval[qid].get("metadata", {}))):
                     raise ValueError("selection inputs use stale observation rendering")
-                for row in (scores[qid], ecv[qid], priors[qid], retrieval[qid].get("metadata", {})):
+                for row in (scores[qid], edge_row, priors[qid], retrieval[qid].get("metadata", {})):
                     snapshot.require_contract(row.get("observations"))
             ids = selected_evidence_ids(retrieval[qid], unit_level=units is not None)
             if units:
@@ -246,17 +261,25 @@ def main() -> int:
                 scores.get(qid), priors[qid], ids,
                 a=a, b=b, c=c, score_field=args.score_field, unit_level=units is not None,
             )
-            local_edges = positive_edges(ecv.get(qid, {}), set(ids), power=args.edge_power)
+            if fixed is None:
+                local_edges = positive_edges(edge_row, set(ids), power=args.edge_power)
+            else:
+                selected_ids = set(ids)
+                local_edges = [(weight, left, right, role) for left in ids
+                    for right, weight, role in fixed.get(left, [])
+                    if left < right and right in selected_ids]
             selected, diagnostic = exact_subset(
                 ids, prize, local_edges, edge_weight=args.edge_weight,
                 root_cost=root_cost, node_cost=node_cost,
             )
+            diagnostic.update(edge_source="ecv" if fixed is None else "offline_explicit",
+                              ecv_enabled=fixed is None, fixed_relation_sha256=fixed_digest)
             if snapshot:
                 from mm_memory_bench.come.types import digest
                 diagnostic.update(observations=snapshot.contract, observation_questions_sha256=questions_digest,
                     evidence_identity=UNIT_EVIDENCE_PROTOCOL, observation_rendering=rendering_contract(),
-                    pruning_inputs_sha256=digest([scores[qid], ecv[qid], priors[qid], retrieval[qid],
-                                                 calibration, args.edge_weight, args.edge_power, root_cost, node_cost]))
+                    pruning_inputs_sha256=digest([scores[qid], edge_row, priors[qid], retrieval[qid],
+                                                 calibration, args.edge_weight, args.edge_power, root_cost, node_cost, fixed_digest]))
             output[qid] = {
                 "question_id": qid,
                 "context_id": retrieval[qid]["context_id"],

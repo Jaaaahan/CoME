@@ -180,6 +180,17 @@ python scripts/run_graphmemix_release.py benchmark \
   --to-stage judge
 ```
 
+For a no-ECV ablation, add `--disable-ecv`. This skips ECV inference and uses
+fixed offline explicit edges for both selection and pruning, retaining node
+verification and the candidate pool. Outputs are isolated under `no-ecv/` within
+the dataset run directory. To reuse existing node scores, start at `select`:
+
+```bash
+python scripts/run_graphmemix_release.py benchmark \
+  --dataset memeye --backbone qwen3vl8b --disable-ecv \
+  --from-stage select --to-stage reader --base-url http://127.0.0.1:8000/v1
+```
+
 The stages are `observations` (optional preprocessing), `checkpoint`, `priors`,
 `relations`, `node`, `ecv`, `select`, `prune`, `reader`, and `judge`. Queries read
 the frozen observations without extracting new ones or changing the index.
