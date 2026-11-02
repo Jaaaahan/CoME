@@ -3,10 +3,19 @@ import json
 import numpy as np
 import pytest
 
-from mm_memory_bench.adaptive_reader import (AdaptiveDecision, FINAL_SYSTEM, FINAL_RESPONSE_FORMAT, candidate_relations,
-    parse_decision, run_adaptive_reader)
+from mm_memory_bench.adaptive_reader import (AdaptiveDecision, SYSTEM, candidate_relations,
+    parse_decision, parse_search_decision, run_adaptive_reader)
 
 VECTORS = {'a': [1., 0.], 'b': [.8, .6], 'c': [0., 1.]}
+
+
+def search_response(*, stop=False, next_query='q'):
+    row = dict(supported=[{'requirement':'Identify the requested objects', 'evidence':['U00']}],
+               missing=[] if stop else ['Find the remaining requested objects'],
+               coverage={'complete':stop, 'reason':'Read evidence covers the request' if stop else 'More matches may exist',
+                         'evidence':['U00'] if stop else []}, action='stop' if stop else 'continue')
+    row.update({'stop_reason':'sufficient_evidence'} if stop else {'next_query':next_query})
+    return json.dumps(row)
 
 
 def run_single_reader(*args, **kwargs):
@@ -160,16 +169,16 @@ def test_decision_retries_on_exhaustion_preserving_multimodal_history():
         calls = []
         def complete(self, messages, **kw):
             self.calls.append(json.loads(json.dumps(messages)))
-            return json.dumps({'action':'continue','next_query':'x'} if len(self.calls)==1 else {'answer':'done'})
+            return '' if len(self.calls)==1 else 'done'
     reader, model = Reader(), Model()
     original = reader.answer_model
     relations = {u: {'belongs_to_memory':'m','semantic_neighbors':[], 'same_session_units':[]} for u in ['a','b']}
     decision = AdaptiveDecision(reader, model, {}, relations)
     assert decision(('a','b'), 0, (), ('a','b')) == {'action':'stop','answer':'done'}
     assert reader.answer_model is original and decision.calls == 2
-    assert model.calls[0][1]['content'][0]['text'] == 'a'
-    assert model.calls[0][1]['content'][1]['text'] == 'b'
-    assert model.calls[0][1]['content'][2]['type'] == 'image_url'
+    assert model.calls[0][0]['content'][0]['text'] == 'a'
+    assert model.calls[0][0]['content'][1]['text'] == 'b'
+    assert model.calls[0][0]['content'][2]['type'] == 'image_url'
 
 
 def test_query_table_semantic_and_exact_reuse_and_threshold():
@@ -265,14 +274,14 @@ def test_actual_api_budget_includes_format_retries():
         def complete(self,messages,**kw):
             self.calls+=1
             if self.calls==1: return '{}'
-            assert messages[0]['content'] == FINAL_SYSTEM
-            assert kw['response_format'] == FINAL_RESPONSE_FORMAT
-            return '{"answer":"unknown"}'
+            assert messages == [{'role':'user','content':'evidence'}]
+            assert kw == {}
+            return 'unknown'
     model=Model()
     decision=AdaptiveDecision(Reader(),model,{}, {'a':{'belongs_to_memory':'m','same_session_units':[], 'semantic_neighbors':[]}},max_calls=2)
     control=dict(force_answer=False,stop_reason=None,new_unit_ids=['a'])
     assert decision(('a',),10,(),('a',),control)['action']=='stop'
-    assert model.calls==2 and control['stop_reason']=='call_budget'
+    assert model.calls==2 and control['stop_reason']=='budget_exhausted' and control['stop_detail']=='call_budget'
     with pytest.raises(ValueError,match='API call budget'):
         decision(('a',),10,(),('a',),control)
     assert model.calls==2
@@ -344,7 +353,7 @@ def test_two_unit_repeated_query_stops_at_twenty_cached_units():
     assert len(result['trace'])==10 and result['stop_reason']=='round_budget'
 
 
-@pytest.mark.parametrize('raw', ['{"action":"continue","next_query":"more evidence"}', '{}', 'not JSON'])
+@pytest.mark.parametrize('raw', ['', '   ', None])
 def test_final_call_invalid_decision_records_unanswered_without_extra_call(raw):
     class Reader:
         answer_model = None
@@ -361,7 +370,7 @@ def test_final_call_invalid_decision_records_unanswered_without_extra_call(raw):
     control = dict(force_answer=False, stop_reason=None, new_unit_ids=['a'])
     result = decision(('a',), 10, (), ('a',), control)
     assert result['action'] == 'stop' and 'no valid final answer' in result['answer'].lower()
-    assert model.calls == 1 and control['stop_reason'] == 'call_budget'
+    assert model.calls == 1 and control['stop_reason'] == 'budget_exhausted' and control['stop_detail'] == 'call_budget'
     assert control['answer_fallback']['reason'] == 'invalid_final_answer'
     assert control['invalid_answers'][0]['raw'] == raw
 
@@ -375,7 +384,7 @@ def test_invalid_final_decision_does_not_abort_reader_or_next_question():
         calls = 0
         def complete(self, messages, **kwargs):
             self.calls += 1
-            return '{"action":"continue","next_query":"q"}'
+            return search_response() if messages[0]['role']=='system' else ''
     ids=[str(i) for i in range(48)]
     relations={u:{'belongs_to_memory':'m','same_session_units':[], 'semantic_neighbors':[]} for u in ids}
     model=Model()
@@ -384,7 +393,8 @@ def test_invalid_final_decision_does_not_abort_reader_or_next_question():
         result=run_adaptive_reader('q',ids,{u:[1,0] for u in ids},encode=lambda q:[1,0],decide=decision)
         assert result['answer_status']=='invalid_final_answer'
         assert len(result['retrieved_unit_ids'])==20 and len(result['trace'])==10
-        assert decision.calls==10 and result['stop_reason']=='round_budget'
+        assert decision.calls==10 and result['stop_reason']=='budget_exhausted'
+        assert result['stop_detail']=='round_budget'
         assert result['trace'][-1]['controller']['answer_fallback']['reason']=='invalid_final_answer'
     assert model.calls==20
 
@@ -403,16 +413,14 @@ def test_final_stage_uses_original_question_and_all_twenty_images_not_search_his
         packets=[]
         def complete(self, messages, **kwargs):
             self.packets.append(json.loads(json.dumps(messages)))
-            if messages[0]['content'] == FINAL_SYSTEM:
-                assert kwargs['response_format']==FINAL_RESPONSE_FORMAT
-                context=json.loads(messages[-1]['content'])
-                assert context['original_question']=='ORIGINAL QUESTION: count the red objects.'
-                assert not {'previous_queries','controller','remaining_count'} & context.keys()
+            if messages[0]['role'] == 'user':
+                assert kwargs == {}
+                assert len(messages)==1
+                assert messages[0]['content'][0]['text']=='ORIGINAL QUESTION: count the red objects.'
                 assert 'intermediate-search-only' not in json.dumps(messages)
-                assert len(context['relations'])==20
-                assert len([p for p in messages[1]['content'] if p['type']=='image_url'])==20
-                return '{"answer":"There are three red objects."}'
-            return '{"action":"continue","next_query":"intermediate-search-only"}'
+                assert len([p for p in messages[0]['content'] if p['type']=='image_url'])==20
+                return 'There are three red objects.'
+            return search_response(next_query='intermediate-search-only')
     ids=[str(i) for i in range(48)]
     relations={u:{'belongs_to_memory':'m','same_session_units':[], 'semantic_neighbors':[]} for u in ids}
     model=Model()
@@ -424,7 +432,7 @@ def test_final_stage_uses_original_question_and_all_twenty_images_not_search_his
     assert result['trace'][-1]['controller']['stage']=='final_answer'
 
 
-def test_early_search_stop_still_gets_separate_fixed_final_answer():
+def test_early_search_stop_preserves_assessment_and_uses_canonical_final_answer():
     class Reader:
         answer_model=None
         def _generate_answer(self,*args,**kwargs):
@@ -434,14 +442,155 @@ def test_early_search_stop_still_gets_separate_fixed_final_answer():
         def complete(self,messages,**kwargs):
             self.calls+=1
             if self.calls==1:
-                assert messages[0]['content']!=FINAL_SYSTEM
-                return '{"action":"stop","answer":"ignore this intermediate answer"}'
-            assert messages[0]['content']==FINAL_SYSTEM
-            assert 'ignore this intermediate answer' not in json.dumps(messages)
-            return '{"answer":"final answer"}'
+                assert messages[0]['content']==SYSTEM
+                return search_response(stop=True)
+            assert messages==[{'role':'user','content':'original question plus evidence'}]
+            assert kwargs=={}
+            return 'final answer'
     ids=list(VECTORS)
     relations={u:{'belongs_to_memory':'m','same_session_units':[], 'semantic_neighbors':[]} for u in ids}
     decision=AdaptiveDecision(Reader(),Model(),{},relations)
     result=run_adaptive_reader('q',ids,VECTORS,encode=lambda q:[1,0],decide=decision)
     assert result['prediction']=='final answer' and len(result['retrieved_unit_ids'])==2
-    assert result['stop_reason']=='model_stop' and decision.search_calls==decision.answer_calls==1
+    assert result['stop_reason']=='sufficient_evidence' and decision.search_calls==decision.answer_calls==1
+    controller=result['trace'][0]['controller']
+    assert controller['search_decision']==json.loads(search_response(stop=True))
+    assert controller['search_decision_raw']==search_response(stop=True)
+
+
+@pytest.mark.parametrize('change,error', [
+    ({'supported':[]}, 'sufficient_evidence'),
+    ({'supported':[{'requirement':'Match', 'evidence':['U02']}]}, 'read_units'),
+    ({'supported':[{'requirement':'Match', 'evidence':[]}]}, 'read_units'),
+    ({'missing':['Other matching photos may remain']}, 'missing'),
+    ({'coverage':{'complete':False, 'reason':'Only one match found', 'evidence':[]}}, 'sufficient_evidence'),
+    ({'coverage':{'complete':True, 'reason':'All found', 'evidence':['U02']}}, 'read_units'),
+    ({'coverage':{'complete':True, 'reason':'', 'evidence':['U00']}}, 'coverage'),
+    ({'coverage':{'complete':True, 'reason':'All found', 'evidence':[]}}, 'read_units'),
+    ({'coverage':None}, 'coverage'),
+    ({'stop_reason':'budget_exhausted'}, 'stop_reason'),
+])
+def test_sufficiency_rejects_ungrounded_or_incomplete_assessments(change, error):
+    row=json.loads(search_response(stop=True))
+    row.update(change)
+    with pytest.raises(ValueError, match=error):
+        parse_search_decision(json.dumps(row), read_aliases=['U00','U01'])
+
+
+def test_cannot_find_more_keeps_missing_requirements_and_requires_explanation():
+    row=json.loads(search_response())
+    row.update(action='stop', stop_reason='cannot_find_more')
+    with pytest.raises(ValueError, match='stop_explanation'):
+        parse_search_decision(json.dumps(row), read_aliases=['U00'])
+    row['stop_explanation']='Available query directions do not address the missing location.'
+    parsed=parse_search_decision(json.dumps(row), read_aliases=['U00'])
+    assert parsed['missing'] and not parsed['coverage']['complete']
+    assert parsed['stop_reason']=='cannot_find_more'
+
+
+@pytest.mark.parametrize('invalid_kind', ['unread', 'missing', 'list_incomplete'])
+def test_invalid_sufficiency_is_repaired_and_reads_more_evidence(invalid_kind):
+    invalid=json.loads(search_response(stop=True))
+    if invalid_kind=='unread':
+        invalid['supported'][0]['evidence']=['U04']
+    elif invalid_kind=='missing':
+        invalid['missing']=['Find other matching photos']
+    else:
+        invalid['coverage']={'complete':False, 'reason':'One match does not establish all photos', 'evidence':[]}
+    class Reader:
+        answer_model=None
+        def _generate_answer(self, question, ids, **kwargs):
+            self.answer_model.complete([{'role':'user','content':list(ids)}])
+    class Model:
+        calls=0
+        def complete(self, messages, **kwargs):
+            self.calls+=1
+            if self.calls==1:
+                context=json.loads(messages[-1]['content'])
+                assert context['read_units']==[
+                    {'alias':'U00','unit_id':'0','evidence_number':1},
+                    {'alias':'U01','unit_id':'1','evidence_number':2}]
+                assert 'U04' in context['unit_aliases']  # Known but unread: cannot cite it.
+                return json.dumps(invalid)
+            if self.calls==2:
+                assert 'Invalid retrieval decision' in messages[-1]['content']
+                return search_response()
+            if self.calls==3:
+                context=json.loads(messages[-1]['content'])
+                assert context['previous_assessment']==json.loads(search_response())
+                return search_response(stop=True)
+            assert messages==[{'role':'user','content':['0','1','2','3']}]
+            return 'The matching photos are ...'
+    ids=[str(i) for i in range(6)]
+    relations={u:{'belongs_to_memory':'m','same_session_units':[], 'semantic_neighbors':[]} for u in ids}
+    decision=AdaptiveDecision(Reader(),Model(),{},relations)
+    result=run_adaptive_reader('q',ids,{u:[1,0] for u in ids},encode=lambda q:[1,0],decide=decision)
+    assert result['retrieved_unit_ids']==ids[:4]
+    assert result['stop_reason']=='sufficient_evidence'
+    assert result['trace'][0]['controller']['invalid_decisions'][0]['raw']==json.dumps(invalid)
+    assert result['trace'][0]['controller']['search_decision']['missing']
+    assert decision.calls==4
+
+
+@pytest.mark.parametrize('reason', ['cannot_find_more', 'invalid_decision_retries_exhausted', 'exhausted'])
+def test_incomplete_search_and_retry_exhaustion_never_become_sufficient(reason):
+    class Reader:
+        answer_model=None
+        def _generate_answer(self, *args, **kwargs):
+            self.answer_model.complete([{'role':'user','content':'original question and evidence'}])
+    class Model:
+        def complete(self, messages, **kwargs):
+            if messages[0]['role']=='user':
+                return 'Insufficient information.'
+            if reason=='invalid_decision_retries_exhausted':
+                return '{}'
+            row=json.loads(search_response())
+            row.update(action='stop', stop_reason='cannot_find_more', stop_explanation='No useful remaining search direction.')
+            return json.dumps(row)
+    ids=list(VECTORS)[:1 if reason=='exhausted' else 3]
+    relations={u:{'belongs_to_memory':'m','same_session_units':[], 'semantic_neighbors':[]} for u in ids}
+    decision=AdaptiveDecision(Reader(),Model(),{},relations,retries=2)
+    result=run_adaptive_reader('q',ids,VECTORS,encode=lambda q:[1,0],decide=decision)
+    assert result['stop_reason']==('budget_exhausted' if reason=='invalid_decision_retries_exhausted' else 'cannot_find_more')
+    controller=result['trace'][-1]['controller']
+    if reason=='cannot_find_more':
+        assert controller['search_decision']['missing']
+        assert controller['search_decision']['stop_explanation']
+    else:
+        assert result['stop_detail']==reason
+        if reason=='invalid_decision_retries_exhausted':
+            assert len(controller['invalid_decisions'])==2
+    assert decision.calls<=decision.max_calls
+
+
+@pytest.mark.parametrize('tool_mode', [None, 'plan'])
+def test_final_request_equals_real_come_renderer_including_tools_and_images(tmp_path, tool_mode):
+    from PIL import Image
+    from mm_memory_bench.methods.concrete_memix import ConcreteMemixMethod
+    from mm_memory_bench.adaptive_reader import PacketCapture
+    path=tmp_path/'evidence.png'
+    Image.new('RGB', (4,4), 'red').save(path)
+    reader=ConcreteMemixMethod.__new__(ConcreteMemixMethod)
+    reader.drop_reader_ocr=False
+    reader.reader_ocr_budget_chars=0
+    reader.observation_contract=None
+    reader._record_by_id={'a':{'text':'A red object', 'source_id':'photo-1', 'modality':'image',
+                              'content':[{'type':'image', 'path':str(path)}]}}
+    question={'instruction':'Explain your answer with evidence.',
+              'prompt':[{'type':'text','text':'What is shown?'}, {'type':'image','path':str(path)}],
+              'tools':[{'type':'function','function':{'name':'find_photo','parameters':{'type':'object'}}}],
+              'tool_mode':tool_mode}
+    baseline=PacketCapture()
+    reader.answer_model=baseline
+    reader._generate_answer(question, ['a'], image_max_edge=1280)
+    class Model:
+        def complete(self, messages, **kwargs):
+            assert messages==baseline.messages
+            assert kwargs==baseline.kwargs
+            assert kwargs['tools']==(None if tool_mode=='plan' else question['tools'])
+            return 'It is red.\n\nEvidence: photo-1 shows a red object.'
+    decision=AdaptiveDecision(reader,Model(),question,
+        {'a':{'belongs_to_memory':'m','same_session_units':[], 'semantic_neighbors':[]}})
+    result=decision(('a',),0,(),('a',))
+    assert result['answer']=='It is red.\n\nEvidence: photo-1 shows a red object.'
+    assert reader.answer_model is baseline

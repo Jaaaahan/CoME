@@ -202,7 +202,7 @@ visible to the reader; the existing seed retrieval retains its multimodal policy
 Memory vectors use normalized means of their indexed views; observation vectors
 use their stored crop-description representation.
 
-The reader consumes **two new units per call, at most 10 rounds and 20 units per question**,
+The reader consumes **two new units per reading round, at most 10 rounds and 20 units per question**,
 retaining all visited multimodal evidence. The candidate pool still contains up to
 48 units. Each query caches its top 20 currently unread candidates from that pool
 (or fewer if fewer remain), plus scores and a record of consumed units. The
@@ -226,22 +226,40 @@ cached to avoid recomputing their scores; they do not become active. Later cache
 hits are compared against the then-active query. Acceptance is a query-level gate,
 not a per-unit fallback, and is a retrieval heuristic rather than proof of accuracy.
 
-Retrieval decisions and final answering are separate stages. Retrieval calls return
-only stop or continue/next_query. When the model stops searching, the candidates run
-out, or round 10 reaches the 20-unit cap, a fresh answer-only request contains the
-original question, all visited images/descriptions, and compact relations. It has a
-fixed system prompt and a strict schema containing only `answer`; intermediate
-queries, decisions and tentative answers are excluded from this final request.
+Retrieval decisions and final answering are separate stages. ENM decisions report
+`supported` requirements with references to **already-read unit aliases**, `missing`
+requirements, and explicit `coverage` (complete, reason, evidence). `read_units`
+maps aliases to canonical Evidence numbers, which can differ after query switching.
+A `sufficient_evidence` stop requires nonempty supported evidence, no missing
+requirements, and complete coverage backed by read references. For list/all-photo
+questions, the decision prompt requires an explanation of completeness; one match
+alone does not establish that all requested photos have been found. Validation
+checks references and consistency, not whether the model's visual claims are true.
+Invalid decisions receive a repair request within the existing retry/call limits.
+Accepted assessments and raw decisions, plus invalid responses and validation
+errors, are retained in the trace's controller fields.
+
+Stops distinguish `sufficient_evidence`, `cannot_find_more`, and `budget_exhausted`.
+A model claiming it cannot find more must explain why; unresolved requirements
+remain recorded. Candidate/query exhaustion is also `cannot_find_more`. Round,
+unit, API-call and decision-retry limits are `budget_exhausted`, with the specific
+cause in `stop_detail`. Neither of these reasons claims evidence sufficiency.
+
+The final call reuses **the canonical CoME answer request unchanged**, including
+its original question/instruction, all visited images/descriptions, and tool
+parameters. No extra answer system prompt or JSON schema is imposed. Retrieval
+assessments, relations, intermediate queries and tentative answers are excluded
+from this final request. The model's plain-text answer is retained.
 
 The default limits are 10 reading rounds and **10 actual API calls including
 format retries**. One call is always reserved for the final answer. Without retries,
-a full run uses nine retrieval decisions followed by one answer-only call after
-reading units 19 and 20. Early stopping also goes through the fixed final-answer
-stage. Retries can shorten retrieval. Invalid retrieval decisions fall through to
-final answering when retries are exhausted. If final answering itself fails to
-produce a valid answer within its budget, an explicitly unanswered row is recorded
-with raw response/error details and receives zero credit; the next question proceeds.
-The old three-batch and stagnation blocking rules remain removed.
+a full run uses nine retrieval decisions followed by one final call after reading
+units 19 and 20. Early stopping also goes through the canonical final-answer stage.
+Retries can shorten retrieval. Invalid retrieval decisions fall through to final
+answering when retries are exhausted. Empty/non-text final responses retry the same
+canonical request within the remaining budget. If no valid answer is produced,
+an explicitly unanswered row is recorded with raw response/error details; the next
+question proceeds. The old three-batch and stagnation blocking rules remain removed.
 
 No node verification, ECV, forest selection, or pruning is performed. Query matching,
 query table size, switching and stopping settings are part of the resume contract;

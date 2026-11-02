@@ -569,12 +569,20 @@ def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bund
     class DecisionModel(Model):
         def complete(self, messages, **kwargs):
             self.messages.append(deepcopy(messages))
-            if kwargs.get('response_format', {}).get('type') == 'json_schema':
-                return json.dumps({'answer':'vermilion'})
+            if 'response_format' not in kwargs:
+                assert len(messages)==1 and messages[0]['role']=='user'
+                assert 'tools' in kwargs
+                return 'vermilion'
             control = json.loads(messages[-1]['content'])
-            count = len(control['relations'])
-            return json.dumps({'action': 'stop', 'answer': 'vermilion'} if count >= 2 or not control['remaining_count']
-                              else {'action': 'continue', 'next_query': 'vermilion cup'})
+            stop = len(control['read_units']) >= 2
+            refs = [u['alias'] for u in control['read_units']]
+            decision = dict(action='stop' if stop else 'continue',
+                supported=[{'requirement':'Find the cup color', 'evidence':refs}],
+                missing=[] if stop else ['Confirm the cup color'],
+                coverage={'complete':stop, 'reason':'Color confirmed' if stop else 'Need confirmation',
+                          'evidence':refs if stop else []})
+            decision.update({'stop_reason':'sufficient_evidence'} if stop else {'next_query':'vermilion cup'})
+            return json.dumps(decision)
     monkeypatch.setattr(adaptive, 'GMEQwen2VLEmbedder', Embedder)
     monkeypatch.setattr(adaptive, 'SinglePassQwenVL', DecisionModel)
     # Local download receipts may differ while actual checkpoint model identity matches.
@@ -589,13 +597,21 @@ def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bund
     assert row['metadata']['llm_calls'] == 3 and row['metadata']['status'] == 'ok'
     assert row['metadata']['search_calls']==2 and row['metadata']['answer_calls']==1
     assert 'PRIVATE' not in json.dumps(Model.messages[-1])
-    assert any(p['type'] == 'image_url' for p in Model.messages[-1][1]['content'])
+    assert any(p['type'] == 'image_url' for p in Model.messages[-1][0]['content'])
     calls = len(Model.messages)
     assert invoke(monkeypatch, adaptive, *adaptive_args) == 0
     assert len(Model.messages) == calls
     assert before == {p: file_digest(p) for p in before}
     assert all(len(step['unit_ids']) == 1 for step in row['metadata']['trace'])
+    assert row['metadata']['stop_reason']=='sufficient_evidence'
+    assert row['metadata']['trace'][-1]['controller']['search_decision']['supported']
     contract = row['metadata']['adaptive_run_contract']
+    assert contract['final_answer_mode']=='canonical-come-packet-and-tools-unmodified'
+    assert contract['stopping_policy']=='read-evidence-supported-requirements-and-explicit-coverage-v1'
+    with monkeypatch.context() as patch:
+        patch.setattr(adaptive, 'PROTOCOL', 'previous-protocol')
+        with pytest.raises(ValueError, match='incompatible adaptive'):
+            invoke(monkeypatch, adaptive, *adaptive_args)
     assert contract['query_table_size'] == contract['max_units'] == 20
     assert contract['max_rounds'] == contract['max_llm_calls'] == 10
     with pytest.raises(SystemExit):

@@ -101,7 +101,8 @@ def main():
         'query_gate': 'proposed-next-batch-mean-strictly-greater-than-active-next-batch-mean',
         'short_batch_mean': 'available-units-only',
         'max_llm_calls': args.max_llm_calls,
-        'final_answer_mode': 'fixed-answer-only-prompt-with-original-question-and-all-read-evidence',
+        'final_answer_mode': 'canonical-come-packet-and-tools-unmodified',
+        'stopping_policy': 'read-evidence-supported-requirements-and-explicit-coverage-v1',
         'semantic_k': args.semantic_k, 'image_max_edge': args.image_max_edge,
         'reader_ocr_budget_chars': args.reader_ocr_budget_chars, 'max_model_len': args.max_model_len,
         'max_output_tokens': args.max_output_tokens, 'decision_retries': args.decision_retries}
