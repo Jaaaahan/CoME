@@ -564,6 +564,56 @@ def test_cli_pipeline_fields_reach_actual_messages_and_caches_are_read_only(bund
         with pytest.raises(ValueError, match='rendering'):
             invoke(monkeypatch, answer, *answer_args)
     assert len(Model.messages) == calls
+    # Run the adaptive entry point directly from offline artifacts, with no verifier inputs.
+    adaptive = importlib.import_module('scripts.run_graphmemix_adaptive_reader')
+    class DecisionModel(Model):
+        def complete(self, messages, **kwargs):
+            self.messages.append(deepcopy(messages))
+            if kwargs.get('response_format', {}).get('type') == 'json_schema':
+                return json.dumps({'answer':'vermilion'})
+            control = json.loads(messages[-1]['content'])
+            count = len(control['relations'])
+            return json.dumps({'action': 'stop', 'answer': 'vermilion'} if count >= 2 or not control['remaining_count']
+                              else {'action': 'continue', 'next_query': 'vermilion cup'})
+    monkeypatch.setattr(adaptive, 'GMEQwen2VLEmbedder', Embedder)
+    monkeypatch.setattr(adaptive, 'SinglePassQwenVL', DecisionModel)
+    # Local download receipts may differ while actual checkpoint model identity matches.
+    (model_path / 'download.receipt').write_text('local-only download metadata')
+    adaptive_output = tmp_path / 'adaptive.jsonl'
+    adaptive_args = [*common, '--checkpoint-root', checkpoint, '--source-priors', prior_path,
+        '--relation-store', graph, '--embedding-model', model_path, '--output', adaptive_output,
+        '--source-top-l', 2, '--candidate-limit', 4, '--initial-limit', 3, '--batch-size', 1, '--resume']
+    assert invoke(monkeypatch, adaptive, *adaptive_args) == 0
+    row = rows(adaptive_output)[0]
+    assert row['prediction'] == 'vermilion' and row['metadata']['visited_units'] == 2
+    assert row['metadata']['llm_calls'] == 3 and row['metadata']['status'] == 'ok'
+    assert row['metadata']['search_calls']==2 and row['metadata']['answer_calls']==1
+    assert 'PRIVATE' not in json.dumps(Model.messages[-1])
+    assert any(p['type'] == 'image_url' for p in Model.messages[-1][1]['content'])
+    calls = len(Model.messages)
+    assert invoke(monkeypatch, adaptive, *adaptive_args) == 0
+    assert len(Model.messages) == calls
+    assert before == {p: file_digest(p) for p in before}
+    assert all(len(step['unit_ids']) == 1 for step in row['metadata']['trace'])
+    contract = row['metadata']['adaptive_run_contract']
+    assert contract['query_table_size'] == contract['max_units'] == 20
+    assert contract['max_rounds'] == contract['max_llm_calls'] == 10
+    with pytest.raises(SystemExit):
+        invoke(monkeypatch, adaptive, *adaptive_args, '--max-rounds', 11)
+    with pytest.raises(SystemExit):
+        invoke(monkeypatch, adaptive, *adaptive_args, '--batch-size', 4)
+    with pytest.raises(ValueError, match='incompatible adaptive'):
+        invoke(monkeypatch, adaptive, *adaptive_args, '--query-table-size', 19)
+    pair_output = tmp_path / 'adaptive-pair.jsonl'
+    assert invoke(monkeypatch, adaptive, *adaptive_args, '--output', pair_output, '--batch-size', 2) == 0
+    paired = rows(pair_output)[0]
+    assert paired['metadata']['visited_units'] == 2 and paired['metadata']['llm_calls'] == 2
+    assert len(paired['metadata']['trace'][0]['unit_ids']) == 2
+    assert paired['metadata']['adaptive_run_contract']['batch_size'] == 2
+    with pytest.raises(ValueError, match='incompatible adaptive'):
+        invoke(monkeypatch, adaptive, *adaptive_args, '--batch-size', 2)
+    with pytest.raises(ValueError, match='incompatible adaptive'):
+        invoke(monkeypatch, adaptive, *adaptive_args, '--initial-limit', 2)
     # A new valid snapshot cannot be mixed with old priors, checkpoints or predictions.
     data = rows(sidecar); data[0]['come']['observations'][0]['description'] += ' Changed.'
     write_snapshot(sidecar, data, extraction_contract={'model': 'fixture'})

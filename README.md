@@ -191,6 +191,89 @@ python scripts/run_graphmemix_release.py benchmark \
   --from-stage select --to-stage reader --base-url http://127.0.0.1:8000/v1
 ```
 
+### Adaptive unit reading
+
+`run_graphmemix_adaptive_reader.py` implements query-guided reading directly from
+frozen observation checkpoints, source priors, and relation stores. It takes 24
+retrieved seed units, expands one hop to at most 48 candidates, and recomputes
+cosine similarity against every candidate's checkpoint vector. Original-question
+text and generated queries use the same GME text encoding. Query images remain
+visible to the reader; the existing seed retrieval retains its multimodal policy.
+Memory vectors use normalized means of their indexed views; observation vectors
+use their stored crop-description representation.
+
+The reader consumes **two new units per call, at most 10 rounds and 20 units per question**,
+retaining all visited multimodal evidence. The candidate pool still contains up to
+48 units. Each query caches its top 20 currently unread candidates from that pool
+(or fewer if fewer remain), plus scores and a record of consumed units. The
+original question is the first active query. Global deduplication prevents any
+unit from being read twice, including when switching between cached queries.
+
+Exact normalized query hits skip encoding. Cosine similarity >= `--query-threshold`
+(default 0.95) reuses a fixed representative's ranking and scores; new paraphrases
+are compared to representatives, avoiding transitive similarity drift. Repeating
+the active query continues through its unread list, including the fifth and later
+units. Query repetition alone does not trigger stopping.
+
+A proposed different query is accepted only when **the similarity between the
+proposed query and its next two unread units, averaged, strictly exceeds the mean
+similarity between the last accepted query and its own next two unread units**.
+Both lists skip globally visited units. If fewer than two remain in a list, use
+the mean over its available units without zero padding. There is no extra improvement margin. Equal or lower
+scores reject the proposed direction and keep reading from the previous active
+query, rather than reverting to the original question. Rejected queries remain
+cached to avoid recomputing their scores; they do not become active. Later cache
+hits are compared against the then-active query. Acceptance is a query-level gate,
+not a per-unit fallback, and is a retrieval heuristic rather than proof of accuracy.
+
+Retrieval decisions and final answering are separate stages. Retrieval calls return
+only stop or continue/next_query. When the model stops searching, the candidates run
+out, or round 10 reaches the 20-unit cap, a fresh answer-only request contains the
+original question, all visited images/descriptions, and compact relations. It has a
+fixed system prompt and a strict schema containing only `answer`; intermediate
+queries, decisions and tentative answers are excluded from this final request.
+
+The default limits are 10 reading rounds and **10 actual API calls including
+format retries**. One call is always reserved for the final answer. Without retries,
+a full run uses nine retrieval decisions followed by one answer-only call after
+reading units 19 and 20. Early stopping also goes through the fixed final-answer
+stage. Retries can shorten retrieval. Invalid retrieval decisions fall through to
+final answering when retries are exhausted. If final answering itself fails to
+produce a valid answer within its budget, an explicitly unanswered row is recorded
+with raw response/error details and receives zero credit; the next question proceeds.
+The old three-batch and stagnation blocking rules remain removed.
+
+No node verification, ECV, forest selection, or pruning is performed. Query matching,
+query table size, switching and stopping settings are part of the resume contract;
+use a new output path when changing them or switching from an earlier protocol.
+
+```bash
+PYTHONPATH=src:scripts python scripts/run_graphmemix_adaptive_reader.py \
+  --bundle data/unified/memeye \
+  --observations artifacts/graphmemix/observations-v1/observations/memeye.jsonl \
+  --checkpoint-root artifacts/graphmemix/observations-v1/checkpoints/memeye \
+  --source-priors artifacts/graphmemix/observations-v1/source_priors/memeye.jsonl \
+  --relation-store artifacts/graphmemix/observations-v1/relation_store/memeye.jsonl \
+  --embedding-model /path/to/gme-Qwen2-VL-2B-Instruct \
+  --backend standalone --initial-limit 48 --batch-size 2 \
+  --query-table-size 20 --max-rounds 10 --max-llm-calls 10 \
+  --max-model-len 131072 --image-max-edge 1280 \
+  --base-url http://127.0.0.1:8000/v1 \
+  --output runs/adaptive/memeye/predictions.jsonl --resume
+```
+
+Use the backend and embedding model that produced the checkpoint. The embedding
+model runs in this process; the reader runs at `--base-url`. The entry point
+processes questions sequentially. Use `--question-ids` for a smoke-test subset.
+Output rows contain final answers, visited unit IDs, original scores, each query
+acceptance/rejection with both lists of comparison units, their scores and means, LLM call counts, and elapsed time. Resume checks
+bind results to data, checkpoint, embedding, rendering, code, and run parameters.
+Relations disclose parent memory identity, candidate-local semantic neighbors,
+and same-session IDs without exposing unread neighbors' contents. Full visited
+multimodal evidence is retained each round. Context overflow fails visibly;
+it does not silently discard earlier evidence. Invalid decisions are retried up
+to `--decision-retries` (default 3), including failure to stop at exhaustion.
+
 The stages are `observations` (optional preprocessing), `checkpoint`, `priors`,
 `relations`, `node`, `ecv`, `select`, `prune`, `reader`, and `judge`. Queries read
 the frozen observations without extracting new ones or changing the index.
