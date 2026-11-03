@@ -1,0 +1,26 @@
+program: scripts/run_enm_sweep.py
+name: mem-gallery-full-enm-gpt54mini
+method: random
+run_cap: 24
+metric:
+  name: tune/judge_accuracy
+  goal: maximize
+parameters:
+  query_threshold:
+    values: [0.85, 0.90, 0.95, 0.98, 1.0]
+  source_top_l:
+    values: [8, 16, 24, 32]
+  candidate_limit:
+    values: [32, 48, 64]
+  semantic_k:
+    values: [2, 4, 8]
+  query_table_size:
+    values: [8, 12, 20]
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - trial
+  - --settings
+  - ${envvar:ENM_SWEEP_SETTINGS}
+  - ${args}

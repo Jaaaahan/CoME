@@ -1,0 +1,11 @@
+{
+  "seed": 42,
+  "random_trials": 24,
+  "parameters": {
+    "query_threshold": [0.85, 0.90, 0.95, 0.98, 1.0],
+    "source_top_l": [8, 16, 24, 32],
+    "candidate_limit": [32, 48, 64],
+    "semantic_k": [2, 4, 8],
+    "query_table_size": [8, 12, 20]
+  }
+}

@@ -299,6 +299,114 @@ Cached outputs record their input contracts so incompatible rows cannot be
 silently reused. See [the CoME guide](docs/come.md) for the current workflow and
 [the release guide](docs/graphmemix_release.md) for historical reproduction.
 
+### MemEye and MemoryGallery ENM parameter sweeps
+
+Both canonical datasets are supported, including every MemEye question variant.
+For the logged-in SwanLab account on the cluster, replace the generation command
+below with `scripts/run_enm_swanlab.py generate` using the same arguments. It
+clears all six HTTP/HTTPS/ALL proxy variables and records parameters and question
+generation progress in SwanLab. The `sync` subcommand accepts completed scalar
+metrics as JSON on stdin and resumes the same experiment after API judging.
+The judge only publishes the accuracy after all questions have been scored.
+
+For cluster nodes without W&B/OpenAI access, use the local search driver
+`scripts/run_enm_local_search.py`. It samples 24 distinct configurations with a
+fixed seed plus the default baseline, without importing W&B. The search space
+is in `config/enm_mem_gallery_local_search.json`.
+
+```bash
+python scripts/run_enm_local_search.py plan \
+  --settings /absolute/path/to/settings.json --output search-plan.json
+# Run one index per Slurm array element, with --gres=gpu:2 --array=0-24%1:
+python scripts/run_enm_local_search.py generate \
+  --plan search-plan.json --index 0 --base-url http://127.0.0.1:24481/v1
+```
+
+Generation writes a compact `judge-input.jsonl` and a `generation-complete.json`
+marker only after all answers are present. On a machine with OpenAI access, the
+`watch` command fetches these files through the storage SSH host, verifies hashes
+and question coverage, evaluates with GPT-5.4 mini and updates `leaderboard.json`:
+
+```bash
+python scripts/run_enm_local_search.py watch \
+  --plan search-plan.json --bundle /local/copy/of/the/same/bundle \
+  --remote-root /remote/experiment/root --output runs/enm-local-scores
+```
+
+The scoring bundle needs `manifest.json` and the exact `questions.jsonl` from the
+generation bundle. Successful judgments are reused after interruption. This
+workflow uses two GPUs per dataset at a time; API judging uses no local GPU.
+The remaining instructions describe the optional W&B workflow.
+
+`scripts/run_enm_sweep.py` uses **all 1,711 MemoryGallery questions** in every
+trial, with no development/test split or sampling. The default judge is
+**OpenAI / gpt-5.4-mini** through Chat Completions and the
+existing binary LLM-judge rubric. The W&B objective is `tune/judge_accuracy`
+(maximize), reported as **tuning-set accuracy**. Reader failures count as
+incorrect; judge/API failures are retried and must be resolved before the
+objective is logged. This is a GPT-5.4 mini judge metric, not the benchmark's official
+judge score.
+
+No split preparation is required. The runner takes every question from the
+bundle, verifies complete prediction coverage and records `evaluation_scope:
+full_dataset` in the run metadata. Old `dev_ids.txt` / `test_ids.txt` files are
+unused; remove `split_dir` from older settings files. The new run protocol
+prevents reusing the earlier 200-question experiment outputs.
+
+Copy `config/enm_mem_gallery_settings.example.json` to a local settings file.
+Set paths to the frozen observations, checkpoints, source priors, relation store
+and embedding weights, plus the reader endpoint/context capacity. **Relative paths
+resolve against the settings file's directory.** Configure W&B's project/entity
+there, and provide credentials through the environment:
+
+```bash
+export ENM_SWEEP_SETTINGS=/absolute/path/to/settings.json
+# OPENAI_BASE_URL defaults to https://api.openai.com/v1.
+# Set OPENAI_API_KEY and WANDB_API_KEY through your usual secret configuration.
+
+python scripts/run_enm_sweep.py trial --settings "$ENM_SWEEP_SETTINGS" --dry-run
+```
+
+Preflight checks all questions, stored semantic-neighbor capacity and source-hit
+coverage. It makes no API calls and requires no API key or W&B installation.
+The default judge model ID is `gpt-5.4-mini`, which supports Chat Completions
+and structured outputs ([OpenAI model documentation](https://developers.openai.com/api/docs/models/gpt-5.4-mini)).
+The existing judge client omits `temperature` for GPT-5 models. At the official
+OpenAI endpoint, it also reads `OPENAI_API_KEY` from the repository's ignored
+`.env` file when the environment variable is unset; that file must have owner-only
+permissions (`chmod 600 .env`). W&B also accepts credentials saved by `wandb login`
+in the user's `.netrc`. Credentials never go in the JSON settings file.
+
+Install the optional W&B dependency in the reader's environment, run the default
+baseline, then launch the supplied 24-run random sweep from the repository root:
+
+```bash
+python -m pip install -e '.[sweeps]'
+python scripts/run_enm_sweep.py trial --settings "$ENM_SWEEP_SETTINGS" --run-id baseline
+wandb sweep --project enm-mem-gallery config/enm_mem_gallery_sweep.yaml
+wandb agent ENTITY/PROJECT/SWEEP_ID
+```
+
+The sweep varies `query_threshold`, `source_top_l`, `candidate_limit`, `semantic_k`
+and `query_table_size`. The default `semantic_k` choices are 2/4/8, compatible
+with the available MemoryGallery graph stored at k=8. `initial_limit` follows
+`candidate_limit`. Reading stays
+at two units per round, at most ten rounds, twenty units and ten LLM calls;
+decision attempts stay at three. Graph neighbors beyond the stored
+`max_semantic_k` and seed counts exceeding stored unit hits are rejected before
+generation. The reader/GME environment is the same as for the standalone
+adaptive-reader command; the `sweeps` extra only installs W&B.
+
+Each trial has its own `contract.json`, `reader.log`, `predictions.jsonl`,
+`judgments.jsonl` and `metrics.json` under `output_root/RUN_ID`. Logs record the
+run ID. Resume an interrupted trial with the same settings, sampled parameters
+and `--run-id RUN_ID`; successful judgments are reused. Changed inputs, code,
+judge endpoint or parameters require a new ID. API keys are not written into
+the contract or W&B config. Only aggregate metrics and experiment metadata are
+sent to W&B. Use `--wandb-mode offline` to retain W&B logs locally or `disabled`
+to run without W&B. No Hyperband early termination is configured, and the
+objective is logged exactly once after complete evaluation of each trial.
+
 ## 🧩 ATM-Bench-Hard Evidence-Graph Extension
 
 The repository also contains a specialized 31-question ATM-Bench-Hard

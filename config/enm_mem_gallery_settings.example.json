@@ -1,0 +1,30 @@
+{
+  "bundle": "../data/unified/mem_gallery",
+  "output_root": "../runs/enm-mem-gallery/full-trials",
+  "observations": "/path/to/observations/mem_gallery.jsonl",
+  "checkpoint_root": "/path/to/checkpoints/mem_gallery",
+  "source_priors": "/path/to/source_priors/mem_gallery.jsonl",
+  "relation_store": "/path/to/relation_store/mem_gallery.jsonl",
+  "embedding_model": "/path/to/gme-Qwen2-VL-2B-Instruct",
+  "reader": {
+    "model": "Qwen/Qwen3-VL-8B-Instruct",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "image_max_edge": 1280,
+    "max_model_len": 32768,
+    "max_output_tokens": 1000,
+    "reader_ocr_budget_chars": 320
+  },
+  "judge": {
+    "provider": "openai",
+    "model": "gpt-5.4-mini",
+    "base_url_env": "OPENAI_BASE_URL",
+    "api_key_env": "OPENAI_API_KEY",
+    "concurrency": 4,
+    "retries": 3,
+    "timeout_seconds": 120
+  },
+  "wandb": {
+    "project": "enm-mem-gallery",
+    "mode": "online"
+  }
+}
