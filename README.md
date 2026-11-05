@@ -299,9 +299,19 @@ Cached outputs record their input contracts so incompatible rows cannot be
 silently reused. See [the CoME guide](docs/come.md) for the current workflow and
 [the release guide](docs/graphmemix_release.md) for historical reproduction.
 
-### MemEye and MemoryGallery ENM parameter sweeps
+### ENM parameter sweeps
 
-Both canonical datasets are supported, including every MemEye question variant.
+The adaptive reader now defaults to `--search-decision-mode compact`: intermediate
+responses contain only `action` and, when continuing, a short `next_query`.
+The canonical final-answer messages and tools are unchanged. The previous verbose
+assessment remains available with `--search-decision-mode grounded`. Use separate
+output roots for the two modes; the run contract records the stopping policy.
+Compact prompts omit remaining-candidate counts. Within a question, every new or
+cached-query selection excludes already read units; their content stays in the
+cumulative evidence packet and their graph links remain available as search clues.
+
+Canonical MemEye, MemoryGallery, ATM-Bench and H2HMem bundles are supported,
+including every MemEye question variant.
 For the logged-in SwanLab account on the cluster, replace the generation command
 below with `scripts/run_enm_swanlab.py generate` using the same arguments. It
 clears all six HTTP/HTTPS/ALL proxy variables and records parameters and question

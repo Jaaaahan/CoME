@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full-dataset MemoryGallery ENM tuning, scored by GPT-5.4 mini and logged to W&B.
+"""Full-dataset ENM tuning, scored by an explicit LLM judge and logged to W&B.
 
 Every trial uses all questions in the bundle; no development/test split is used.
 Use `trial` directly or through a W&B sweep agent. --dry-run makes no API calls.
@@ -35,7 +35,7 @@ DEFAULTS = dict(query_threshold=.95, source_top_l=24, candidate_limit=48,
 FIXED = dict(batch_size=2, max_rounds=10, max_llm_calls=10, decision_retries=3)
 READER_DEFAULTS = dict(model="Qwen/Qwen3-VL-8B-Instruct", base_url="http://127.0.0.1:8000/v1",
                        image_max_edge=1280, max_model_len=32768, max_output_tokens=1000,
-                       reader_ocr_budget_chars=320)
+                       reader_ocr_budget_chars=320, search_decision_mode="compact")
 PATH_KEYS = ("bundle", "output_root", "observations", "checkpoint_root",
              "source_priors", "relation_store", "embedding_model")
 
@@ -57,8 +57,8 @@ def write_json(path, value):
 
 def gallery_questions(bundle):
     manifest = read_json(bundle / "manifest.json")
-    if manifest.get("benchmark") not in ("Mem-Gallery", "MemEye"):
-        raise ValueError("this sweep requires a canonical Mem-Gallery or MemEye bundle")
+    if manifest.get("benchmark") not in ("Mem-Gallery", "MemEye", "ATM-Bench", "H2HMem"):
+        raise ValueError("this sweep requires a canonical Mem-Gallery, MemEye, ATM-Bench or H2HMem bundle")
     path = bundle / manifest.get("tables", {}).get("questions", "questions.jsonl")
     if path.resolve() != (bundle / "questions.jsonl").resolve():
         raise ValueError("adaptive reader requires the canonical questions.jsonl path")

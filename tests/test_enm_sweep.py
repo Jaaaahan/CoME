@@ -96,6 +96,35 @@ class ENMSweepTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "remove split_dir"):
             sweep.load_settings(path)
 
+    def test_h2hmem_full_dataset_uses_gpt54_mini(self):
+        sweep.write_json(self.bundle / "manifest.json", {"benchmark": "H2HMem"})
+        path = self.settings()
+        with patch.dict(os.environ, {"OPENAI_BASE_URL": "https://openai.invalid/v1", "OPENAI_API_KEY": "fixture-secret"}), \
+                patch.object(sweep.subprocess, "run", side_effect=self.fake_reader), \
+                patch("mm_memory_bench.judge.urllib.request.urlopen", return_value=self.response()) as request:
+            sweep.trial(self.args(path))
+        self.assertEqual(request.call_count, len(self.rows))
+        self.assertTrue(all(json.loads(call.args[0].data)["model"] == "gpt-5.4-mini"
+                            for call in request.call_args_list))
+        metrics = sweep.read_json(self.root / "trials/baseline/metrics.json")
+        self.assertEqual(metrics["tune/questions"], len(self.rows))
+
+    def test_atm_full_dataset_uses_explicit_gpt5_mini_judge(self):
+        sweep.write_json(self.bundle / "manifest.json", {"benchmark": "ATM-Bench"})
+        path = self.settings()
+        settings = sweep.read_json(path)
+        settings["judge"]["model"] = "gpt-5-mini"
+        sweep.write_json(path, settings)
+        with patch.dict(os.environ, {"OPENAI_BASE_URL": "https://openai.invalid/v1", "OPENAI_API_KEY": "fixture-secret"}), \
+                patch.object(sweep.subprocess, "run", side_effect=self.fake_reader), \
+                patch("mm_memory_bench.judge.urllib.request.urlopen", return_value=self.response()) as request:
+            sweep.trial(self.args(path))
+        self.assertEqual(request.call_count, len(self.rows))
+        self.assertTrue(all(json.loads(call.args[0].data)["model"] == "gpt-5-mini"
+                            for call in request.call_args_list))
+        metrics = sweep.read_json(self.root / "trials/baseline/metrics.json")
+        self.assertEqual(metrics["tune/questions"], len(self.rows))
+
     def test_memeye_full_dataset_keeps_all_variants(self):
         sweep.write_json(self.bundle / "manifest.json", {"benchmark": "MemEye"})
         for row in self.rows:

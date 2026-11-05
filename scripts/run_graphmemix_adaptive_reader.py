@@ -50,6 +50,7 @@ def main():
     p.add_argument('--max-output-tokens', type=int, default=1000)
     p.add_argument('--reader-ocr-budget-chars', type=int, default=320)
     p.add_argument('--decision-retries', type=int, default=3)
+    p.add_argument('--search-decision-mode', choices=['compact', 'grounded'], default='compact')
     p.add_argument('--question-ids', type=Path)
     p.add_argument('--resume', action='store_true')
     args = p.parse_args()
@@ -102,7 +103,10 @@ def main():
         'short_batch_mean': 'available-units-only',
         'max_llm_calls': args.max_llm_calls,
         'final_answer_mode': 'canonical-come-packet-and-tools-unmodified',
-        'stopping_policy': 'read-evidence-supported-requirements-and-explicit-coverage-v1',
+        'stopping_policy': ('compact-action-and-query-v1' if args.search_decision_mode == 'compact' else
+                            'read-evidence-supported-requirements-and-explicit-coverage-v1'),
+        'search_decision_mode': args.search_decision_mode,
+        'remaining_candidate_count_in_prompt': args.search_decision_mode != 'compact',
         'semantic_k': args.semantic_k, 'image_max_edge': args.image_max_edge,
         'reader_ocr_budget_chars': args.reader_ocr_budget_chars, 'max_model_len': args.max_model_len,
         'max_output_tokens': args.max_output_tokens, 'decision_retries': args.decision_retries}
@@ -149,7 +153,8 @@ def main():
             ids = candidate['candidate_ids']
             relations = candidate_relations(ids, graph.nodes, memories, descriptors[cid]['edges'], semantic_k=args.semantic_k)
             decision = AdaptiveDecision(method, model, question, relations,
-                image_max_edge=args.image_max_edge, retries=args.decision_retries, max_calls=args.max_llm_calls)
+                image_max_edge=args.image_max_edge, retries=args.decision_retries, max_calls=args.max_llm_calls,
+                search_decision_mode=args.search_decision_mode)
             def decide_step(visited, remaining, trace, order, controller):
                 value = decision(visited, remaining, trace, order, controller)
                 print(json.dumps({'event': 'adaptive_step', 'question_id': qid,

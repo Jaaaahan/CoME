@@ -20,10 +20,11 @@ def identity(plan_path, row):
     ids, dataset = evaluation_set(Path(plan['settings']['bundle']))
     directory = Path(plan['settings']['output_root']) / row['id']
     return dict(id=hashlib.sha256(str(directory).encode()).hexdigest()[:8],
-        name=f"{Path(plan['settings']['bundle']).name}-{row['id']}",
+        name=f"{Path(plan['settings']['bundle']).name}-{plan['settings']['reader'].get('search_decision_mode', 'grounded')}-{row['id']}",
         config={**row['parameters'], **FIXED, 'tuning_questions': len(ids),
             'evaluation_scope': 'full_dataset', 'score_role': 'tuning_set_accuracy',
-            'questions_sha256': dataset['questions_sha256'], 'judge_model': plan['settings']['judge']['model']},
+            'questions_sha256': dataset['questions_sha256'], 'judge_model': plan['settings']['judge']['model'],
+            'search_decision_mode': plan['settings']['reader'].get('search_decision_mode', 'grounded')},
         directory=str(directory))
 
 
