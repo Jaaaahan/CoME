@@ -82,6 +82,7 @@ def metrics_for(
     predictions: dict[str, dict[str, Any]],
     k: int,
     sessions: Mapping[tuple[str, str], list[str]] | None = None,
+    *, allow_empty: bool = False,
 ) -> dict[str, Any]:
     recalls: list[float] = []
     any_hits = 0
@@ -103,6 +104,11 @@ def metrics_for(
         total_hits += hits
 
     count = len(recalls)
+    if not count and allow_empty:
+        return {"status": "unavailable", "reason": "no questions with gold evidence",
+                "questions": 0, f"R@{k}": None, f"Hit@{k}": None,
+                f"AllGT@{k}": None, f"micro_R@{k}": None,
+                "gold_evidence": 0, "gold_hits": 0}
     if not count:
         raise ValueError("no questions with gold evidence")
     return {

@@ -190,7 +190,7 @@ def main() -> int:
         with (args.output_dir / f"{label}.jsonl").open("w", encoding="utf-8") as handle:
             for row in values.values():
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-        metric = metrics_for((questions[qid] for qid in values), values, args.k, sessions)
+        metric = metrics_for((questions[qid] for qid in values), values, args.k, sessions, allow_empty=True)
         ds = diagnostics[label]
         metric.update({
             "mean_chosen_edges": float(np.mean([d.get("chosen_edges", 0) for d in ds])),

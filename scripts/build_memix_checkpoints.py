@@ -38,7 +38,11 @@ def main() -> int:
     parser.add_argument("--checkpoint-interval", type=int, default=100)
     parser.add_argument("--video-frames", type=int, default=8)
     parser.add_argument("--progress-interval", type=int, default=100)
+    parser.add_argument("--context-shards", type=int, default=1)
+    parser.add_argument("--context-shard-index", type=int, default=0)
     args = parser.parse_args()
+    if args.context_shards < 1 or not 0 <= args.context_shard_index < args.context_shards:
+        parser.error("invalid context shard selection")
 
     reader = BundleReader(args.bundle, caption_sidecar=args.caption_sidecar)
     observations = ObservationSnapshot.from_bundle(args.observations, reader) if args.observations else None
@@ -59,7 +63,7 @@ def main() -> int:
         video_frames=args.video_frames,
     )
     started = time.perf_counter()
-    batches = list(reader.iter_context_batches())
+    batches = list(reader.iter_context_batches())[args.context_shard_index::args.context_shards]
     for index, batch in enumerate(batches, 1):
         context_started = time.perf_counter()
         method.begin_context(_visible_context(batch.context))

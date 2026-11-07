@@ -25,9 +25,15 @@ def main() -> int:
     parser.add_argument("--reasoning-effort", default="none")
     parser.add_argument("--workers", type=int, default=1,
                         help="Independent memory shards; each has its own resumable store")
+    parser.add_argument("--worker-id", type=int,
+                        help="Run only this existing memory shard, writing a shard snapshot")
+    parser.add_argument("--context-workers", type=int, default=1,
+                        help="Concurrent disjoint contexts within each memory shard")
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be positive")
+    if args.context_workers < 1 or (args.worker_id is not None and not 0 <= args.worker_id < args.workers):
+        parser.error("invalid context-workers or worker-id")
     config = json.loads(args.config.read_text())
     preprocess = PreprocessConfig(**config.get("come", {}))
     settings = config.get("observations", {})
@@ -38,36 +44,41 @@ def main() -> int:
     model = OpenAICompatibleQwenVL(generation)
     contract = extraction_contract(model, preprocess)
     memories = raw_memories(BundleReader(args.bundle))
+    expected_memories = memories if args.worker_id is None else memories[args.worker_id::args.workers]
     if args.output.exists() and manifest_path(args.output).exists():
-        snapshot = ObservationSnapshot(args.output, memories)
+        snapshot = ObservationSnapshot(args.output, expected_memories)
         if snapshot.contract["extraction_contract"] != contract:
             raise ValueError("incompatible observation extraction contract; use a new output path")
-        print(json.dumps({"status": "complete", "reused": True, "memories": len(memories)}))
+        print(json.dumps({"status": "complete", "reused": True, "memories": len(expected_memories)}))
         return 0
     def extract_shard(worker: int) -> list[dict]:
         # v1 source references are memory-local. Never split one memory across
         # workers or share mutable catalogs/stores/model diagnostics between them.
-        shard_model = OpenAICompatibleQwenVL(generation)
         root = (args.artifact_root if args.workers == 1 else
                 args.artifact_root / f"workers-{args.workers}" / f"worker-{worker:02d}")
         contexts = {}
         for memory in memories[worker::args.workers]:
             contexts.setdefault(str(memory.get("context_id", "")), []).append(memory)
-        result = []
-        for cid, sources in contexts.items():
+        def extract_context(item):
+            cid, sources = item
+            shard_model = OpenAICompatibleQwenVL(generation)
             service = ObservationPreprocessor(sources, root / "contexts" / digest(cid), shard_model, preprocess)
-            result.extend(service.ingest())
+            result = service.ingest()
             print(json.dumps({"worker": worker, "context_id": cid, "memories": len(sources),
                               "usage": service.ingestion["usage"]}), flush=True)
-        return result
+            return result
+        with ThreadPoolExecutor(max_workers=args.context_workers) as pool:
+            return [row for rows in pool.map(extract_context, contexts.items()) for row in rows]
 
-    if args.workers == 1:
+    if args.worker_id is not None:
+        rows = extract_shard(args.worker_id)
+    elif args.workers == 1:
         rows = extract_shard(0)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             rows = [row for shard in pool.map(extract_shard, range(args.workers)) for row in shard]
     write_snapshot(args.output, rows, extraction_contract=contract)
-    ObservationSnapshot(args.output, memories)
+    ObservationSnapshot(args.output, expected_memories)
     return 0
 
 

@@ -1,15 +1,17 @@
 """Local vLLM proxy with processor-based Qwen3-VL multimodal token counts.
 
 vLLM 0.11.2 /tokenize counts image placeholders, not expanded image tokens.
-Only /tokenize is replaced. Generation payloads are forwarded unchanged.
+Only /tokenize is replaced by default. Optional aspect-ratio padding is applied
+to both tokenization and generation requests.
 """
 import argparse,base64,hashlib,io,json,threading,urllib.error,urllib.request
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from PIL import Image
 from transformers import AutoProcessor
+from qwen_image_padding import pad_request_images, POLICY
 
-p=argparse.ArgumentParser();p.add_argument('--model-path',required=True);p.add_argument('--upstream',required=True);p.add_argument('--port',type=int,required=True);a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--model-path',required=True);p.add_argument('--upstream',required=True);p.add_argument('--port',type=int,required=True);p.add_argument('--pad-qwen-images',action='store_true');a=p.parse_args()
 processor=AutoProcessor.from_pretrained(a.model_path,local_files_only=True)
 lock=threading.Lock();cache=OrderedDict()
 def token_count(payload):
@@ -53,10 +55,12 @@ class Handler(BaseHTTPRequestHandler):
  def do_POST(self):
   try:
    body=self.rfile.read(int(self.headers['Content-Length']))
+   if a.pad_qwen_images and self.path in ('/tokenize','/v1/chat/completions','/chat/completions'):
+    body=json.dumps(pad_request_images(json.loads(body)),ensure_ascii=False).encode()
    if self.path=='/tokenize':
     self.respond(200,json.dumps({'count':token_count(json.loads(body)),'count_source':'qwen3vl_processor_cpu'}).encode())
    else:self.forward(body)
   except Exception as error:self.respond(500,json.dumps({'error':str(error)}).encode())
 
-print(json.dumps({'event':'TOKEN_PROXY_READY','port':a.port,'processor':a.model_path}),flush=True)
+print(json.dumps({'event':'TOKEN_PROXY_READY','port':a.port,'processor':a.model_path,'image_padding':POLICY if a.pad_qwen_images else None}),flush=True)
 ThreadingHTTPServer(('127.0.0.1',a.port),Handler).serve_forever()

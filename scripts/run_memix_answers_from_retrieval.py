@@ -51,6 +51,14 @@ def retrieval_contract_sha256(row: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def resume_contract_matches(stored: Mapping[str, Any], expected: Mapping[str, Any],
+                            *, retry_error: bool) -> bool:
+    """Allow only the missing retrieval digest in old error rows being regenerated."""
+    if retry_error and "retrieval_row_sha256" not in stored:
+        stored = {**stored, "retrieval_row_sha256": expected["retrieval_row_sha256"]}
+    return stored == expected
+
+
 class ReaderOnlyIndex:
     """Index placeholder: fixed-evidence answer generation never searches."""
 
@@ -628,7 +636,12 @@ def main() -> int:
             "checkpoint_state_sha256": state_hashes.get(str(question["context_id"])),
             "retrieval_row_sha256": retrieval_contract_sha256(retrieval_row),
         }
-        if actual_ids != expected_ids or stored_contract != expected_contract:
+        retry_error = args.retry_errors and (
+            metadata.get("status") == "error" or not str(row.get("prediction", "")).strip()
+        )
+        if actual_ids != expected_ids or not resume_contract_matches(
+            stored_contract, expected_contract, retry_error=retry_error
+        ):
             incompatible_completed.append(question_id)
     if incompatible_completed:
         raise RuntimeError(
@@ -908,6 +921,7 @@ def main() -> int:
                                 "payload too large",
                                 "exceeds model's maximum context length",
                                 "exceeds the model's maximum context length",
+                                "longer than the maximum model length",
                             )
                         ):
                             resize_after_transport_error = True
@@ -957,6 +971,7 @@ def main() -> int:
                                         "checkpoint_state_sha256": state_hashes[
                                             str(questions[question_id]["context_id"])
                                         ],
+                                        "retrieval_row_sha256": retrieval_contract_sha256(retrieval_row),
                                     },
                                 },
                                 0.0,

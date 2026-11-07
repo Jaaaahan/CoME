@@ -291,7 +291,7 @@ def main() -> int:
         with path.open("w", encoding="utf-8") as handle:
             for qid in qids:
                 handle.write(json.dumps(output[qid], ensure_ascii=False) + "\n")
-        metric = metrics_for((questions[qid] for qid in qids), output, retrieval_k, sessions)
+        metric = metrics_for((questions[qid] for qid in qids), output, retrieval_k, sessions, allow_empty=True)
         metric.update({
             "mean_selected": float(np.mean(lengths)),
             "median_selected": float(np.median(lengths)),
